@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "n1-landscape"
+version = "0.1.0"
+description = "Superconformal-index pipeline of the 4d N=1 SCFT landscape program for product gauge groups"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "cms1308" }]
+dependencies = ["mpmath>=1.3"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/cms1308/n1-landscape"
+
+[tool.setuptools]
+packages = ["landscape"]
+
+[tool.setuptools.package-data]
+landscape = ["schema/*.json", "data/*.json"]

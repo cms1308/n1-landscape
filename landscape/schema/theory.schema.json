@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://landscape.local/schema/theory.schema.json",
+  "title": "Theory",
+  "type": "object",
+  "required": ["nodes", "fields", "terms", "flips", "names"],
+  "additionalProperties": false,
+  "properties": {
+    "nodes": {"type": "array", "minItems": 1, "items": {"type": "array", "prefixItems": [{"type": "string", "pattern": "^[A-G]$"}, {"type": "integer", "minimum": 1}], "minItems": 2, "maxItems": 2}},
+    "fields": {"type": "array", "items": {"type": "array", "items": {"type": "array", "items": {"type": "integer", "minimum": 0}}}},
+    "terms": {"type": "array", "items": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0}, {"type": "integer", "minimum": 1}], "minItems": 2, "maxItems": 2}}},
+    "flips": {"type": "object", "patternProperties": {"^[0-9]+$": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0}, {"type": "integer", "minimum": 1}], "minItems": 2, "maxItems": 2}}}, "additionalProperties": false},
+    "names": {"type": "array", "items": {"type": "string"}}
+  }
+}

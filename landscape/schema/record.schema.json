@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://landscape.local/schema/record.schema.json",
+  "title": "Record",
+  "type": "object",
+  "required": ["schema_version", "theory", "charges", "flavor", "index", "operators", "verdict", "canonical", "identity", "provenance"],
+  "additionalProperties": false,
+  "$defs": {
+    "number": {"type": "string", "pattern": "^-?[0-9]+(/[0-9]+|\\.[0-9]+)?$", "description": "exact rational p/q, or a decimal with up to 30 significant digits"},
+    "monomial": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0}, {"type": "integer"}], "minItems": 2, "maxItems": 2}},
+    "operator_list": {"type": "array", "items": {"type": "object", "required": ["monomial", "multiplicity"], "additionalProperties": false, "properties": {"monomial": {"$ref": "#/$defs/monomial"}, "multiplicity": {"type": "integer"}}}}
+  },
+  "properties": {
+    "schema_version": {"type": "string"},
+    "theory": {"$ref": "theory.schema.json"},
+    "charges": {
+      "type": "object",
+      "required": ["R", "a", "c", "rational"],
+      "additionalProperties": false,
+      "properties": {
+        "R": {"type": "array", "items": {"anyOf": [{"$ref": "#/$defs/number"}, {"type": "null"}]}, "description": "one entry per field, source order"},
+        "a": {"anyOf": [{"$ref": "#/$defs/number"}, {"type": "null"}]},
+        "c": {"anyOf": [{"$ref": "#/$defs/number"}, {"type": "null"}]},
+        "rational": {"type": "boolean"}
+      }
+    },
+    "flavor": {
+      "type": "object",
+      "required": ["basis", "rank"],
+      "additionalProperties": false,
+      "properties": {
+        "basis": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}, "description": "Hermite normal form of the saturated integer kernel; rows = U(1) generators, columns = fields in the theory's order"},
+        "rank": {"type": "integer", "minimum": 0}
+      }
+    },
+    "index": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "object", "required": ["t_order", "terms"], "additionalProperties": false,
+         "properties": {
+           "t_order": {"type": "integer"},
+           "terms": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}, {"type": "array", "items": {"type": "integer"}}, {"$ref": "#/$defs/number"}], "minItems": 4, "maxItems": 4}, "description": "the full refined index with constant term 1: [t milli-exponent, y power, flavor exponents in the flavor basis, coefficient]"}
+         }}
+      ]
+    },
+    "operators": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decoupled": {"$ref": "#/$defs/operator_list"},
+        "flipped": {"$ref": "#/$defs/operator_list"},
+        "relevant": {"$ref": "#/$defs/operator_list"},
+        "marginal": {"$ref": "#/$defs/operator_list"}
+      }
+    },
+    "verdict": {"type": "string"},
+    "canonical": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "object", "required": ["hash", "ambiguous_terms", "node_perm", "conj", "field_perm"], "additionalProperties": false,
+         "properties": {
+           "hash": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+           "ambiguous_terms": {"type": "array", "items": {"type": "integer"}},
+           "node_perm": {"type": "array", "items": {"type": "integer"}},
+           "conj": {"type": "array", "items": {"type": "boolean"}},
+           "field_perm": {"type": "array", "items": {"type": "integer"}}
+         }}
+      ]
+    },
+    "identity": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}], "description": "sha256 of t_order, the unrefined index below t^t_order and the central charges a, c rounded half-even to 25 significant digits (model.identity_of_fixed_point) - the key of the fixed point for the database, independent of the flavor basis; null without an index or central charges and null for a flagged (ambiguous) theory. The enumeration's equivalence (enumerate.equivalent) compares the unrefined index and the central charges within a relative tolerance of 10^-25: equal identities are neither sufficient nor necessary for it (they disagree at rounding boundaries; on the checked records the two gave the same marks). Complete retrieval of a record's candidates uses the unrefined-index key (enumerate.fixed_point_key, computable from the stored index) followed by that predicate and the rank rule, as the enumeration does; an identity lookup is an optimization only with that fallback"},
+    "provenance": {"type": "object"},
+    "analysis": {
+      "type": "object",
+      "required": ["consistency", "dim3", "nonmanifest_symmetry", "susy_enhanced", "flags"],
+      "additionalProperties": false,
+      "description": "results of the post-processing that are neither operators nor the verdict",
+      "properties": {
+        "consistency": {"type": "string", "description": "C1/C2 of the old Index check alone, before C1'/C3 and the central-charge bounds"},
+        "dim3": {"anyOf": [{"type": "integer"}, {"type": "null"}], "description": "t^6 coefficient of the unrefined scalar part of the reduced index"},
+        "nonmanifest_symmetry": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+        "susy_enhanced": {"type": "boolean", "description": "C3 at j = 1/2: extra supercurrent signal"},
+        "unlisted_positive_terms": {"anyOf": [{"$ref": "#/$defs/operator_list"}, {"type": "null"}], "description": "positive terms of the F-term-substituted scalar part at 0 < E < 6 that the inherited entry rule does not list as relevant (net coefficient zero at their own flavor)"},
+        "negative_power_terms": {"anyOf": [{"$ref": "#/$defs/operator_list"}, {"type": "null"}], "description": "positive terms with a negative power of a field (a conjugate-fermion letter of a field outside the superpotential): kept out of every operator list"},
+        "flags": {"type": "object"}
+      }
+    }
+  }
+}
