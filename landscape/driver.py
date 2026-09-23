@@ -190,10 +190,13 @@ def _load_final(out: Path, L: int, inputs: Sequence[dict], errors: Sequence[dict
 # the run
 # --------------------------------------------------------------------------- #
 def run(seed: Theory, out_dir, levels: int, *, name: str, store_dir, t_order: int = 9, low_order: int = 3,
-        core: int = 15, tform_workers: int = 4, projector_core: int = 1, match_timeout: float = 600.0,
+        core: Optional[int] = None, tform_workers: int = 4, projector_core: int = 1, match_timeout: float = 600.0,
         stop_after: Optional[Tuple[int, int]] = None, log=print) -> dict:
     """Run `seed` through levels 0..levels; resumable.  `stop_after = (L, k)` stops the run
-    once level L holds k records (for the resumability check) and reports `interrupted`."""
+    once level L holds k records (for the resumability check) and reports `interrupted`.
+    `core` = worker processes, the machine's CPU count by default."""
+    if core is None:
+        core = os.cpu_count() or 1
     out = Path(out_dir)
     cfg = {"seed": name, "seed_theory": seed.to_json(), "nodes": [[n.type, n.rank] for n in seed.nodes],
            "store_dir": str(store_dir), "out_dir": str(out), "t_order": t_order, "low_order": low_order,

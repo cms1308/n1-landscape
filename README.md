@@ -129,7 +129,7 @@ Verdict classes (in the order they are tested): `gauge-anomaly`, `witten-anomaly
   requested order is recorded as `index-not-computed`.
 - FORM's scratch files go to a per-process directory under the runner's work directory
   and are removed after a timeout.
-- `driver.run` defaults to 15 worker processes; pass `core=` to match your machine.
+- `driver.run` uses one worker process per CPU by default (`core=`).
   LiE deadlines are wall-clock, so the machine must stay awake during long runs.
 
 ## Citing
