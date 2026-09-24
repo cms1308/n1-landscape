@@ -27,7 +27,7 @@ Every record is a JSON document validated against `landscape/schema/record.schem
 
 ## Requirements
 
-- Python >= 3.10 and [mpmath](https://mpmath.org/)
+- Python >= 3.10, [mpmath](https://mpmath.org/) and [SymPy](https://www.sympy.org/) (installed by `pip install .`); `pip install .[validate]` adds `jsonschema` for `record.validator()`
 - [FORM](https://www.nikhef.nl/~form/) (`form`, and `tform` for the parallel path) on `PATH`
 - [LiE](http://wwwmathlabo.univ-poitiers.fr/~maavl/LiE/) (`lie`) on `PATH`
 
