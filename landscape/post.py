@@ -27,6 +27,16 @@ are not affected.
 
 `columns` are the fields of a theory; the argument `field_cols` exists for synthetic
 inputs whose flavor exponents are given as extra columns instead of through a basis.
+
+The native pass (step 43; singlet.NATIVE_POST): when the expansion is a
+model.FieldResolvedExpansion -- its rows held by the extension -- `index`, `decouple` and
+`prefilter` take the reduced index, its flavor projection and the net index of `scan` from
+one call of FieldResolvedRows.reduce (`_reduced_native`) instead of the linear passes
+`reduced_index`, `project_flavor` and `scan` over the terms; the field-resolved reduced index
+comes back at 0 < E <= 6 only, the exponents the operator extraction reads.  Everything
+after those dictionaries -- the y-peel, the F-term rules, the operator lists, C1/C2, the
+routing -- is the same code on either path.  A plain list of terms, or an overflow of the
+pass, runs the Python functions, which remain the reference.
 """
 from __future__ import annotations
 
@@ -297,7 +307,13 @@ def scan(terms: Iterable[FieldResolvedTerm], t_order: int) -> dict:
         if c:
             for dm, dy, s in _KERNEL:
                 net[(m + dm, y + dy)] = net.get((m + dm, y + dy), 0) + s * c
-    flags = {"c4_vanishing": not refined, "c1prime": [], "c3_free": [], "c3_enhance": [], "noninteger": []}
+    return _scan_flags(bool(refined), net, t_order)
+
+
+def _scan_flags(nonvanishing: bool, net: Dict[Tuple[int, int], F], t_order: int) -> dict:
+    """The flags of `scan` from the net reduced index (milli, y) -> coefficient (zero entries
+    optional) and whether the expansion minus 1 is nonempty."""
+    flags = {"c4_vanishing": not nonvanishing, "c1prime": [], "c3_free": [], "c3_enhance": [], "noninteger": []}
     if flags["c4_vanishing"]:
         return flags
     max_milli = 1000 * t_order
@@ -350,9 +366,39 @@ class PostResult:
                                   ("relevant", self.relevant), ("marginal", self.marginal)) if v is not None}
 
 
+def _native_of(terms):
+    """The native rows of an expansion (model.FieldResolvedExpansion), None for a plain sequence."""
+    return getattr(terms, "native", None)
+
+
+def _reduced_native(native, basis: Sequence[Sequence[int]], t_order: int):
+    """One native pass (FieldResolvedRows.reduce) -> (vanishing, fullpower, blocks, index2, net):
+    whether the expansion minus 1 is empty (`not reduced_index(terms, None)`, scan's c4), the y
+    maximum of the reduced index below t_order (None when empty), the field-resolved reduced
+    index at 0 < E <= 6 (the exponents the operator extraction reads; `reduced_index` restricted),
+    its flavor projection below t_order (`project_flavor`) and the net index of `scan`; the
+    dictionaries as the Python functions build them.  None on an overflow of the pass (the Python
+    functions then run), PostProcessingError on an overflow over a flavor-refined expansion.  The
+    y maximum of a flavor-refined expansion is an upper bound of the reduced index's y support (the
+    projection may cancel its top), which is all the y-peel of the blocks needs."""
+    try:
+        vanishing, fullpower, blocks, index2, net = native.reduce([list(map(int, row)) for row in basis],
+                                                                  int(round(1000 * t_order)), 6000)
+    except OverflowError as e:
+        if native.n_flavor_rows:            # flavor-refined above t^6: no Python path exists for these rows
+            raise PostProcessingError(f"native post pass overflow on a flavor-refined expansion: {e}")
+        return None
+    return (vanishing, fullpower, {(m, y, v): F(c) for m, y, v, c in blocks},
+            {(m, y, fl): F(c) for m, y, fl, c in index2}, {(m, y): F(c) for m, y, c in net})
+
+
 def _setup(terms, basis, w, field_cols):
-    terms = list(terms)
-    n = len(terms[0].markers) if terms else 0
+    native = _native_of(terms)
+    if native is None:
+        terms = list(terms)
+        n = len(terms[0].markers) if terms else 0
+    else:
+        n = native.n_fields
     cols = list(range(n)) if field_cols is None else list(field_cols)
     return terms, cols, [dict(m) for m in w]
 
@@ -363,13 +409,21 @@ def decouple(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]],
     (R <= 2/3), after the F-term substitution."""
     terms, cols, w = _setup(terms, basis, w, field_cols)
     res = PostResult(decoupled=[])
-    if not reduced_index(terms, None):
-        return res
-    reduced = reduced_index(terms, t_order)
-    index2 = project_flavor(reduced, basis)
+    native = _native_of(terms)
+    pre = _reduced_native(native, basis, t_order) if native is not None else None
+    if pre is not None:
+        vanishing, fullpower, reduced, index2, _ = pre
+        if vanishing:
+            return res
+    else:
+        terms = list(terms)
+        if not reduced_index(terms, None):
+            return res
+        reduced = reduced_index(terms, t_order)
+        index2 = project_flavor(reduced, basis)
     if not index2:
         return res
-    scalars = extract_scalar(reduced, _y_max(reduced))
+    scalars = extract_scalar(reduced, fullpower if pre is not None else _y_max(reduced))
     unrefined = extract_scalar(index2, _y_max(index2))
     if not unrefined:
         res.relevant, res.flipped = [], []
@@ -387,20 +441,69 @@ def decouple(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]],
     return res
 
 
+def c12_violated(indexscalar: Poly, indexspinor: Poly, power: int) -> bool:
+    """The C1/C2 block of `index` (the old Index mcode): a negative scalar coefficient below t^6;
+    a spinor term at y^k below its floor t^{2+k}; a spinor term of the wrong sign below t^{6+k}.
+    Each predicate is monotone in the term set, so a violation among the exact terms of a
+    low-order expansion (`prefilter`) is a violation of the full-order pass."""
+    if any(m < 6000 and c < 0 for (m, _, _), c in indexscalar.items()):
+        return True
+    if indexspinor:
+        for k in range(power, 0, -1):
+            ms = [m for (m, y, _) in indexspinor if y == k]
+            if ms and min(ms) < 2000 + 1000 * k:
+                return True
+        for (m, y, _), c in indexspinor.items():
+            k = abs(y)
+            if m < 6000 + 1000 * k and (1 if c > 0 else -1) == (-1) ** (1 + k):
+                return True
+    return False
+
+
+def prefilter(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], order: int) -> bool:
+    """Early rejection: True when the flavor-refined reduced index below t^order -- the exact
+    part of an expansion of that order -- already violates C1/C2, so that `index` at the full
+    order returns `inconsistent-index` whatever the higher terms; False decides nothing (a
+    violation above the order, C4, the free-sector routing and the operators need the full
+    order).  An empty index below the order decides nothing either."""
+    if not len(terms):
+        return False
+    native = _native_of(terms)
+    pre = _reduced_native(native, basis, order) if native is not None else None
+    if pre is not None:
+        index2 = pre[3]
+    else:
+        index2 = project_flavor(reduced_index(list(terms), order), basis)
+    if not index2:
+        return False
+    power = _y_max(index2)
+    return c12_violated(extract_scalar(index2, power), {k: c for k, c in index2.items() if k[1] >= 1}, power)
+
+
 def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w: Sequence[Dict[int, int]],
           t_order: int, field_cols: Optional[Sequence[int]] = None) -> PostResult:
     """The full-order pass: C4, C1/C2, operators, C1'/C3."""
     terms, cols, w = _setup(terms, basis, w, field_cols)
     res = PostResult()
-    res.flags = scan(terms, t_order)
+    native = _native_of(terms)
+    pre = _reduced_native(native, basis, t_order) if native is not None else None
+    if pre is not None:
+        vanishing, fullpower, reduced2, index2, net = pre
+        res.flags = _scan_flags(not vanishing, net, t_order)
+    else:
+        terms = list(terms)
+        res.flags = scan(terms, t_order)
     if res.flags["c4_vanishing"]:
         res.consistency = res.verdict = "vanishing-index"
         res.decoupled = []
         return res
     wvars = sorted({k for m in w for k in m})
-    reduced2 = reduced_index(terms, t_order)
-    index2 = project_flavor(reduced2, basis)
-    power, fullpower = _y_max(index2), _y_max(reduced2)
+    if pre is None:
+        reduced2 = reduced_index(terms, t_order)
+        index2 = project_flavor(reduced2, basis)
+        power, fullpower = _y_max(index2), _y_max(reduced2)
+    else:
+        power = _y_max(index2)
     fullscalar = extract_scalar(reduced2, fullpower)
     indexscalar = extract_scalar(index2, power)
     indexspinor = {k: c for k, c in index2.items() if k[1] >= 1}
@@ -411,23 +514,8 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
     has_six = any(m == 6000 for m, _, _ in fullscalar)
 
     # 1. C1/C2
-    if any(m < 6000 and c < 0 for (m, _, _), c in indexscalar.items()):
+    if c12_violated(indexscalar, indexspinor, power):
         res.consistency = "inconsistent-index"
-    elif indexspinor:
-        floor_hit = False
-        for k in range(power, 0, -1):
-            ms = [m for (m, y, _) in indexspinor if y == k]
-            if ms and min(ms) < 2000 + 1000 * k:
-                floor_hit = True
-                break
-        if floor_hit:
-            res.consistency = "inconsistent-index"
-        else:
-            for (m, y, _), c in indexspinor.items():
-                k = abs(y)
-                if m < 6000 + 1000 * k and (1 if c > 0 else -1) == (-1) ** (1 + k):
-                    res.consistency = "inconsistent-index"
-                    break
 
     # 2. operators
     if not entries:

@@ -51,9 +51,9 @@ class _Engine:
     def __init__(self, eng):
         self.eng = eng
 
-    def expansion(self, th, charges, t_order):
+    def expansion(self, th, charges, t_order, basis=None):
         try:
-            return self.eng.expansion(th, charges, t_order)
+            return self.eng.expansion(th, charges, t_order, basis=basis)
         except subprocess.TimeoutExpired:
             return None
 

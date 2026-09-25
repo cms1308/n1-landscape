@@ -14,7 +14,8 @@ Provided here:
     ambiguity flag (multiplicity > 1: the exponent vector does not name the contraction);
   * the canonical form under permutations of identical nodes, permutations of fields
     and conjugation of a node, with the maps from source positions, and its hash;
-  * the two index interfaces — the field-resolved expansion (per-field markers) and the
+  * the two index interfaces — the field-resolved expansion (per-field markers; as a list
+    of terms, or as FieldResolvedExpansion when the extension holds the rows) and the
     physical index (t on the 1/1000 grid, y, flavor exponents, coefficient) — with the
     projection between them, truncation, the flavor basis of a record (single copy) and
     the identity of a fixed point (the equivalence key of the enumeration);
@@ -22,6 +23,7 @@ Provided here:
 """
 from __future__ import annotations
 
+import collections.abc
 import decimal
 import hashlib
 import itertools
@@ -482,10 +484,49 @@ class PhysicalTerm:
     flavor: Tuple[int, ...]       # exponents of the U(1) fugacities in the basis used
 
 
+class FieldResolvedExpansion(collections.abc.Sequence):
+    """A field-resolved expansion whose rows the native extension holds (`native`, a
+    landscape_native.FieldResolvedRows; singlet.NATIVE_POST): the post-processing and `project`
+    read the reduced index, its flavor projection, the net index and the physical index from one
+    native pass over the rows; as a sequence it yields the FieldResolvedTerms of the Python path,
+    built on demand (the fallback and every other reader).  An expansion flavor-refined above
+    t^6 (singlet.NATIVE_FLAVOR) has field-resolved terms through t^6 only: iterating it raises
+    TypeError, and the native pass has no Python fallback for it."""
+    __slots__ = ("native",)
+
+    def __init__(self, native):
+        self.native = native
+
+    def __len__(self) -> int:
+        return len(self.native)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return list(self)[i]
+        num, milli, ypow, markers = self.native.row(i)
+        return FieldResolvedTerm(F(num), milli, ypow, markers)
+
+    def __iter__(self):
+        for num, _, milli, ypow, markers in self.native.rows():
+            yield FieldResolvedTerm(F(num), milli, ypow, markers)
+
+
 def project(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]]) -> List[PhysicalTerm]:
     """Physical index from the field-resolved expansion: flavor_a = sum_f B[a][f] n_f;
     terms with equal (t, y, flavor) merge — the markers are what keeps colliding
-    charges apart before this projection."""
+    charges apart before this projection.  On a FieldResolvedExpansion the sums are those of
+    the native pass (sorted as below; an overflow of its 128-bit integers falls back to the
+    Python loop on the same terms)."""
+    native = getattr(terms, "native", None)
+    if native is not None:
+        try:
+            rows = native.project([list(map(int, row)) for row in basis])
+        except OverflowError:
+            if native.n_flavor_rows:
+                raise
+            rows = None
+        if rows is not None:
+            return [PhysicalTerm(F(c), m, y, fl) for m, y, fl, c in rows]
     acc: Dict[tuple, F] = {}
     for t in terms:
         fl = tuple(sum(b * nf for b, nf in zip(row, t.markers)) for row in basis)

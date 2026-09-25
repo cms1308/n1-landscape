@@ -48,15 +48,27 @@ The package runs on Python alone. The `native/` directory holds an optional Rust
 - the character-arithmetic engine (Adams operations and tensor products with LiE's output
   format) in place of the LiE subprocess for the calls of the character store and the projector;
 - the expansion engine in place of the FORM run: the exponential of the single-letter series,
-  truncated as FORM truncates it.
+  truncated as FORM truncates it, the monomials above t^6 carried in the flavor exponents of the
+  record's basis instead of the field markers (the post-processing reads field-resolved terms
+  through t^6 only);
+- the post-processing pass over the engine's rows: the reduced index, its flavor projection,
+  the net index and the physical index in one native pass, the F-term substitution, the
+  operator lists and the record staying in Python.
 
 With the extension a record needs no FORM and no LiE subprocess. On the 51-theory reference
 sample of the development record the summed wall of the records fell from 263 s (the package
-before its speed work, FORM and LiE included) to 18 s with the extension; the changes to the
-Python path and to the FORM program alone account for about half of that fall. Every
-native function is checked against the pure-Python path, FORM or LiE on the same inputs and
-gives the same records; the pure-Python path stays the reference and the fallback (a program
-whose 128-bit coefficients overflow runs FORM; an lcode outside the engine's forms runs LiE).
+before its speed work, FORM and LiE included) to 8.7 s with the extension; the changes to the
+Python path and to the FORM program alone account for about half of the first fall to 18 s.
+Every native function is checked against the pure-Python path, FORM or LiE on the same inputs
+and gives the same records; the pure-Python path stays the reference and the fallback (a
+program whose 128-bit coefficients overflow, or whose expansion exceeds the engine's monomial
+cap, runs FORM; an lcode outside the engine's forms runs LiE).
+
+Independently of the extension, `record.build` rejects a theory early when the C1/C2 conditions
+already fail on the exact part of an order-6 expansion (`prefilter=(3, 6)`, the default;
+`prefilter=None` disables it): such a record carries its index and identity at order 6
+(`index.t_order`, `provenance.prefilter_order`) and the order-9 expansion is skipped -- in a
+campaign, where most candidates are rejected, this halves the wall of a rejection-heavy batch.
 
 Build and install it with a Rust toolchain (`rustup`) and `maturin`:
 
@@ -67,7 +79,12 @@ pip install ./native
 Switches (environment variables, read at import): `LANDSCAPE_NATIVE=0` selects the pure-Python
 parser and expansion, `LANDSCAPE_NATIVE_EXPAND=0` the term-level path with the native parser,
 `LANDSCAPE_NATIVE_FORM=0` the FORM run, `LANDSCAPE_NATIVE_LIE=0` the LiE subprocess,
-`LANDSCAPE_NATIVE_THREADS=n` the engines' thread count. Without the extension every switch is
+`LANDSCAPE_NATIVE_POST=0` the Python post-processing, `LANDSCAPE_NATIVE_FLAVOR=0` the
+field-resolved expansion through the full order, `LANDSCAPE_NATIVE_THREADS=n` the engines'
+thread count, `LANDSCAPE_NATIVE_MAX_TERMS=n` the engine's monomial cap (default 8,000,000; a
+larger expansion runs FORM). Two further switches, `LANDSCAPE_NATIVE_COEF64=1` and
+`LANDSCAPE_NATIVE_EXACT=1`, turn on variants of the engine's arithmetic and truncation that were
+measured and not adopted; they give the same records. Without the extension every switch is
 inert.
 
 ## Quick start

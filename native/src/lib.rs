@@ -23,7 +23,9 @@
 //! call are shared objects (equal values).
 //!
 //! `expand_series(...)` (module `series`) is the expansion engine in place of FORM: the
-//! exponential of the explicit itotal, truncated as FORM truncates it.
+//! exponential of the explicit itotal, truncated as FORM truncates it, with the refinements of
+//! step 44 as parameters (the flavor projection above t^6, the 64-bit coefficient path, the exact
+//! truncation).
 //!
 //! `lie_run(lcode, timeout)` (module `lie`) is the character-arithmetic engine: LiE's stdout
 //! for the `Adams` and `tensor` lcode forms of the pipeline, byte for byte, NotImplementedError
@@ -37,8 +39,13 @@
 //! marker symbols `f<i>` mapped to field i - 1; it returns the sorted list of
 //! (numerator, denominator, milli, y power, markers) with nonzero sums, the field-resolved
 //! expansion of `landscape.index.field_resolved` without the Term objects in between.
+//!
+//! `FieldResolvedRows` (module `post`) is the native post-processing pass of step 43: `expand` and
+//! `expand_series` return their rows as this object when asked (`native_rows`), and it answers the
+//! reduced index, its flavor projection, the net index and the physical index over them.
 
 mod lie;
+mod post;
 mod series;
 
 use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
@@ -347,8 +354,10 @@ fn add_fraction(acc: &mut (i128, i128), num: i128, den: i128) -> PyResult<()> {
     Ok(())
 }
 
-/// expand(text, n_nodes, n_fields, t_order, lookup) -> list[(num, den, milli, ypow, markers)]
+/// expand(text, n_nodes, n_fields, t_order, lookup, native_rows=False) -> list[(num, den, milli, ypow, markers)],
+/// or the rows as a FieldResolvedRows object when native_rows is set
 #[pyfunction]
+#[pyo3(signature = (text, n_nodes, n_fields, t_order, lookup, native_rows=false))]
 fn expand<'py>(
     py: Python<'py>,
     text: &str,
@@ -356,7 +365,8 @@ fn expand<'py>(
     n_fields: usize,
     t_order: i64,
     lookup: Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyList>> {
+    native_rows: bool,
+) -> PyResult<Py<PyAny>> {
     let limit: i128 = 1000i128 * t_order as i128;
     let mut mults: HashMap<Vec<NodeChars>, i128> = HashMap::new();
     let mut acc: HashMap<(i128, i64, Vec<i64>), (i128, i128)> = HashMap::new();
@@ -396,16 +406,7 @@ fn expand<'py>(
     }
     let mut rows: Vec<((i128, i64, Vec<i64>), (i128, i128))> = acc.into_iter().filter(|(_, (n, _))| *n != 0).collect();
     rows.sort();
-    let out = PyList::empty(py);
-    for ((milli, ypow, markers), (num, den)) in rows {
-        if den != 1 {
-            return Err(PyValueError::new_err(format!(
-                "non-integral coefficient {num}/{den} at t^{} y^{ypow} {markers:?}", milli as f64 / 1000.0)));
-        }
-        let m = PyTuple::new(py, markers.iter().copied())?;
-        out.append((num, den, milli, ypow, m))?;
-    }
-    Ok(out)
+    post::emit_rows(py, rows, Vec::new(), n_fields, None, native_rows)
 }
 
 #[pymodule]
@@ -415,6 +416,7 @@ fn landscape_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lie::lie_run, m)?)?;
     m.add_function(wrap_pyfunction!(lie::lie_dim, m)?)?;
     m.add_function(wrap_pyfunction!(series::expand_series, m)?)?;
-    m.add("__version__", "0.4.0")?;
+    m.add_class::<post::FieldResolvedRows>()?;
+    m.add("__version__", "0.6.0")?;
     Ok(())
 }

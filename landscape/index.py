@@ -19,8 +19,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import form
 from .convert import index_string, reduce_index
-from .model import (CanonicalForm, FieldResolvedTerm, PhysicalTerm, Theory, canonical_flavor_basis, canonical_form,
-                    project)
+from .model import (CanonicalForm, FieldResolvedExpansion, FieldResolvedTerm, PhysicalTerm, Theory, canonical_flavor_basis,
+                    canonical_form, project)
 from . import singlet
 from .singlet import ProductProjector, Term, parse_term, parse_terms, project_terms
 from .store import LabelStore
@@ -40,9 +40,13 @@ def open_stores(th: Theory, store_dir: str | Path, lie_runner=None, create: bool
     return out
 
 
-def field_resolved_native(rows) -> List[FieldResolvedTerm]:
+def field_resolved_native(rows):
     """The rows of singlet.expand_native -> FieldResolvedTerms (integral coefficients, as
-    field_resolved asserts)."""
+    field_resolved asserts); the rows kept in the extension (a FieldResolvedRows object,
+    singlet.NATIVE_POST) -> a FieldResolvedExpansion, the sequence of the same terms built on
+    demand, whose native rows the post-processing and model.project read."""
+    if not isinstance(rows, list):
+        return FieldResolvedExpansion(rows)
     out = []
     for num, den, milli, ypow, markers in rows:
         assert den == 1, f"non-integral coefficient {num}/{den} at t^{milli / 1000} y^{ypow} {markers}"
@@ -82,16 +86,23 @@ class IndexEngine:
         self._core = core
         self._match_timeout = match_timeout
 
-    def expansion(self, th: Theory, charges: Sequence, t_order: int) -> Optional[List[FieldResolvedTerm]]:
-        """Field-resolved expansion through t^t_order; None on the "stop" of form.program
-        or a FORM timeout."""
+    def expansion(self, th: Theory, charges: Sequence, t_order: int, basis: Optional[Sequence[Sequence[int]]] = None):
+        """Field-resolved expansion through t^t_order (a list of FieldResolvedTerms, or a
+        FieldResolvedExpansion holding the rows in the extension when singlet.NATIVE_POST is
+        set); None on the "stop" of form.program or a FORM timeout.  With `basis` (the flavor
+        basis of the record) and singlet.NATIVE_FLAVOR, the engine carries the monomials above
+        t^6 flavor-refined and the expansion's rows above t^6 are flavor-refined (the native post
+        pass consumes them; the field-resolved terms then exist through t^6 only)."""
         assert len(th.nodes) == self.projector.n_nodes
         if singlet.NATIVE_FORM:
             series = form.itotal_terms(th, charges, t_order)
             if series is None:                       # the stop of form.program
                 return None
+            flavor = [list(map(int, row)) for row in basis] if (basis is not None and singlet.NATIVE_POST and singlet.NATIVE_FLAVOR) else None
             try:
-                rows = singlet.expand_series_native(series, self.projector, form.FORM_TIMEOUT_S, self._match_timeout)
+                rows = singlet.expand_series_native(series, self.projector, form.FORM_TIMEOUT_S, self._match_timeout,
+                                                    native_rows=singlet.NATIVE_POST, basis=flavor, exact=singlet.NATIVE_EXACT,
+                                                    coef64=singlet.NATIVE_COEF64)
                 return field_resolved_native(rows)
             except singlet.NativeOverflow:
                 pass                                 # the FORM path below
@@ -104,8 +115,15 @@ class IndexEngine:
         if out is None:
             return None
         if singlet.NATIVE_EXPAND:
-            return field_resolved_native(singlet.expand_native(out, len(th.nodes), th.n_fields(), t_order,
-                                                               self.projector, self._match_timeout))
+            try:
+                return field_resolved_native(singlet.expand_native(out, len(th.nodes), th.n_fields(), t_order,
+                                                                   self.projector, self._match_timeout,
+                                                                   native_rows=singlet.NATIVE_POST))
+            except ValueError as e:
+                if "overflow" not in str(e):
+                    raise
+                # a coefficient beyond 128 bits in the combined pass (expansion orders above
+                # about 20): the Python parser and projector, arbitrary precision
         terms = parse_terms(out, len(th.nodes))
         return field_resolved(project_terms(terms, self.projector, self._core, self._match_timeout),
                               th.n_fields(), t_order)

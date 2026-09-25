@@ -733,9 +733,12 @@ pub fn print_poly(poly: &Poly, rank: usize) -> String {
 static GROUPS: Mutex<Option<HashMap<String, Group>>> = Mutex::new(None);
 static POOL_INIT: std::sync::Once = std::sync::Once::new();
 
-/// The rayon pool: LANDSCAPE_NATIVE_THREADS threads when set, rayon's default (the core count)
-/// otherwise; built once.
-fn init_pool() {
+/// The rayon pool: LANDSCAPE_NATIVE_THREADS threads when set, rayon's default (the core count,
+/// or RAYON_NUM_THREADS) otherwise; built once, at the first rayon entry point of the process
+/// (`lie_run` here, `expand_series` in `series`) -- until 0.4.1 only `lie_run` called it, so an
+/// expansion before the first LiE call fixed the pool at the core count and the switch was
+/// without effect on warm stores.
+pub(crate) fn init_pool() {
     POOL_INIT.call_once(|| {
         if let Ok(v) = std::env::var("LANDSCAPE_NATIVE_THREADS") {
             if let Ok(n) = v.trim().parse::<usize>() {

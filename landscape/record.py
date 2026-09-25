@@ -5,9 +5,18 @@ as JSON lines.
 The per-theory sequence follows the original landscape code: charges -> expansion at the
 low order -> operators at R <= 2/3 -> when there are any, one of them is flipped (a
 trivial field X with the term X.O added, the flip recorded in `theory.flips`) and the
-sequence restarts -> otherwise the expansion at the full order (no descent to a lower
-order when it is not returned) -> conditions and operators.  The operator flipped is the
-first entry of the decoupled list (sorted by monomial).
+sequence restarts -> otherwise the early-rejection stage (`prefilter`: post.prefilter, the
+C1/C2 conditions on the exact part of a low-order expansion -- the decoupling pass's order-3
+expansion first, then an expansion of order 6; a violation found there is a violation of the
+full-order pass, so the theory is recorded inconsistent-index from that order, post.index at
+that order giving its index, identity and analysis, `index.t_order` that order and
+`provenance.prefilter_order` recording it, and the full-order expansion is skipped; a hit whose
+post.index raises or does not return inconsistent-index falls back to the full order,
+`provenance.prefilter_fallback` recording why; a low-order expansion that is not returned
+leaves the decision to the full order, so the stage never causes index-not-computed) ->
+otherwise the expansion at the full order
+(no descent to a lower order when it is not returned) -> conditions and operators.  The
+operator flipped is the first entry of the decoupled list (sorted by monomial).
 
 Verdicts: those of amax.VERDICTS, those of post.INDEX_VERDICTS, and
   negative-central-charge, hofman-maldacena-violation   (checked in this order before the
@@ -30,7 +39,7 @@ from __future__ import annotations
 import json
 from fractions import Fraction as F
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import mpmath as mp
 
@@ -66,8 +75,11 @@ def _ratio_verdict(a, c) -> Optional[str]:
     return None
 
 
-def build(th: Theory, engine, t_order: int = 9, low_order: int = 3, provenance: Optional[dict] = None) -> dict:
-    """The record of `th` (after the flips of its decoupled operators)."""
+def build(th: Theory, engine, t_order: int = 9, low_order: int = 3, provenance: Optional[dict] = None,
+          prefilter: Optional[Sequence[int]] = (3, 6)) -> dict:
+    """The record of `th` (after the flips of its decoupled operators).  `prefilter`: the orders
+    below t_order at which the early-rejection stage evaluates C1/C2 (an order equal to
+    low_order reuses the decoupling pass's expansion); None disables the stage."""
     prov = dict(provenance or {})
     prov.setdefault("record_version", RECORD_VERSION)
     flipped_ops: List[dict] = []
@@ -98,7 +110,7 @@ def build(th: Theory, engine, t_order: int = 9, low_order: int = 3, provenance: 
         if res.verdict != "consistent":
             return rec(res.verdict)
         charges = res.charges_json()["R"]
-        low = engine.expansion(th, charges, low_order)
+        low = engine.expansion(th, charges, low_order, basis=basis)
         if low is None:
             return rec("index-not-computed")
         try:
@@ -111,15 +123,35 @@ def build(th: Theory, engine, t_order: int = 9, low_order: int = 3, provenance: 
             flipped_ops = flipped_ops + [{"operator": dec.decoupled[0]["monomial"], "field": th.n_fields()}]
             th = flip(th, op)
             continue
-        order = t_order                  # no descent to lower orders
-        terms = engine.expansion(th, charges, order)
+        order, terms, out = t_order, None, None     # no descent to lower orders
+        for k in (prefilter or ()):                 # early rejection on the exact part of a low order
+            if not low_order <= k < t_order:
+                continue
+            low_k = low if k == low_order else engine.expansion(th, charges, k, basis=basis)
+            if low_k is None:
+                break                               # not returned (a stop, or a timeout under load): the full order decides
+            if not post.prefilter(low_k, basis, k):
+                continue
+            try:
+                out_k = post.index(low_k, basis, th.terms, k)
+            except post.PostProcessingError as e:
+                prov_here["prefilter_fallback"] = f"order {k}: {e}"
+                break
+            if out_k.verdict != "inconsistent-index":
+                prov_here["prefilter_fallback"] = f"order {k}: {out_k.verdict}"
+                break
+            order, terms, out = k, low_k, out_k
+            prov_here["prefilter_order"] = k
+            break
         if terms is None:
-            return rec("index-not-computed")
-        try:
-            out = post.index(terms, basis, th.terms, order)
-        except post.PostProcessingError as e:
-            prov_here["post_processing_error"] = str(e)
-            return rec("post-processing-error", terms, order)
+            terms = engine.expansion(th, charges, order, basis=basis)
+            if terms is None:
+                return rec("index-not-computed")
+            try:
+                out = post.index(terms, basis, th.terms, order)
+            except post.PostProcessingError as e:
+                prov_here["post_processing_error"] = str(e)
+                return rec("post-processing-error", terms, order)
         verdict = _ratio_verdict(res.a, res.c) or out.verdict
         analysis = {"consistency": out.consistency, "dim3": out.dim3, "nonmanifest_symmetry": out.nonmanifest_symmetry,
                     "susy_enhanced": out.susy_enhanced, "unlisted_positive_terms": out.unlisted,

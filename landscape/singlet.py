@@ -152,8 +152,8 @@ try:                                            # the optional native extension 
 except ImportError:                             # the pure-Python path
     _native = None
 
-def _switch(var: str) -> bool:
-    return os.environ.get(var, "1").strip().lower() not in ("0", "off", "no", "")
+def _switch(var: str, default: str = "1") -> bool:
+    return os.environ.get(var, default).strip().lower() not in ("0", "off", "no", "")
 
 
 # The native parser is used when the extension imports and LANDSCAPE_NATIVE is not 0/off/no;
@@ -168,6 +168,21 @@ NATIVE_EXPAND = NATIVE and hasattr(_native, "expand") and _switch("LANDSCAPE_NAT
 # extension, FORM the reference and the fallback (an overflow of the 128-bit coefficients, a
 # missing extension or the switch off run FORM as before).
 NATIVE_FORM = NATIVE and hasattr(_native, "expand_series") and _switch("LANDSCAPE_NATIVE_FORM")
+# The native post-processing pass (LANDSCAPE_NATIVE_POST; on by default when the extension provides
+# FieldResolvedRows): the engine and the combined pass keep their rows in the extension, and
+# post.index / post.decouple / post.prefilter and model.project read the reduced index, its flavor
+# projection, the net index and the physical index from one native pass over them; the Python
+# functions are the reference and the fallback (a plain list of FieldResolvedTerms, or an overflow).
+NATIVE_POST = NATIVE and hasattr(_native, "FieldResolvedRows") and _switch("LANDSCAPE_NATIVE_POST")
+# The refinements of the expansion engine (step 44), each gated separately and on by default only
+# where adopted: the flavor projection above t^6 (LANDSCAPE_NATIVE_FLAVOR, adopted -- on by default;
+# the rows above t^6 are then flavor-refined, which only the native post pass consumes, so it needs
+# NATIVE_POST), the 64-bit coefficient path (LANDSCAPE_NATIVE_COEF64, declined: 4.5 % on the engine
+# stage, off by default) and the exact-milli truncation (LANDSCAPE_NATIVE_EXACT, declined: no gain, off
+# by default).
+NATIVE_FLAVOR = NATIVE_POST and NATIVE_FORM and _switch("LANDSCAPE_NATIVE_FLAVOR")
+NATIVE_COEF64 = NATIVE_FORM and _switch("LANDSCAPE_NATIVE_COEF64", "0")
+NATIVE_EXACT = NATIVE_FORM and _switch("LANDSCAPE_NATIVE_EXACT", "0")
 
 
 def native_available() -> bool:
@@ -182,33 +197,50 @@ def native_form_available() -> bool:
     return _native is not None and hasattr(_native, "expand_series")
 
 
+def native_post_available() -> bool:
+    return _native is not None and hasattr(_native, "FieldResolvedRows")
+
+
 class NativeOverflow(ArithmeticError):
     """The series engine's 128-bit coefficients overflowed; the caller falls back to FORM."""
 
 
+class NativeCapacity(NativeOverflow):
+    """The series engine's expansion exceeds its monomial cap (LANDSCAPE_NATIVE_MAX_TERMS, default
+    8,000,000 per power and in total: a theory of 25 fields at expansion order 38 reached 10 M
+    monomials at k = 5 and 20 GB at k = 6); the caller falls back to FORM, which sorts on disk."""
+
+
 def expand_series_native(series, projector: "ProductProjector", timeout: Optional[float] = None,
-                         budget_s: Optional[float] = None, monomials: bool = False):
+                         budget_s: Optional[float] = None, monomials: bool = False, native_rows: bool = False,
+                         basis=None, exact: bool = False, coef64: bool = False):
     """The native expansion of a `form.Series`: the rows of the field-resolved expansion
-    (as expand_native), or with monomials=True the polynomial itself [(numerator, denominator,
-    exponents)] for the comparison with FORM's output.  NativeOverflow on an overflow;
-    subprocess.TimeoutExpired past the timeout."""
+    (as expand_native; a FieldResolvedRows object when native_rows is set -- with `basis`, the
+    rows above t^6 flavor-refined by it, the object only), or with monomials=True the
+    polynomial itself [(numerator, denominator, exponents)] for the comparison with FORM's
+    output.  `exact` and `coef64` are the engine refinements of step 44.  NativeOverflow on an
+    overflow; subprocess.TimeoutExpired past the timeout."""
     try:
         return _native.expand_series(series.terms, series.t_limit, series.max_order, series.n_fields,
                                      [(node, list(label), k) for node, label, k in series.slots], series.n_nodes,
-                                     series.t_order, lambda chars: projector.multiplicity(chars, budget_s), timeout, monomials)
+                                     series.t_order, lambda chars: projector.multiplicity(chars, budget_s), timeout, monomials,
+                                     native_rows, basis, exact, coef64)
     except ValueError as e:
+        if str(e).startswith("capacity"):
+            raise NativeCapacity(str(e)) from e
         if "overflow" in str(e):
             raise NativeOverflow(str(e)) from e
         raise
 
 
 def expand_native(text: str, n_nodes: int, n_fields: int, t_order: int, projector: "ProductProjector",
-                  budget_s: Optional[float] = None):
+                  budget_s: Optional[float] = None, native_rows: bool = False):
     """The combined native pass: [(numerator, denominator, milli, ypow, markers)] of the
-    field-resolved expansion through t^t_order, the singlet multiplicity of every distinct
-    character product from `projector.multiplicity` (its memo, the stores and LiE as usual;
-    products occurring only in terms above the truncation are not looked up)."""
-    return _native.expand(text, n_nodes, n_fields, t_order, lambda chars: projector.multiplicity(chars, budget_s))
+    field-resolved expansion through t^t_order (a FieldResolvedRows object when native_rows is
+    set), the singlet multiplicity of every distinct character product from
+    `projector.multiplicity` (its memo, the stores and LiE as usual; products occurring only in
+    terms above the truncation are not looked up)."""
+    return _native.expand(text, n_nodes, n_fields, t_order, lambda chars: projector.multiplicity(chars, budget_s), native_rows)
 
 
 def parse_terms(text: str, n_nodes: int) -> List[Term]:
@@ -217,7 +249,13 @@ def parse_terms(text: str, n_nodes: int) -> List[Term]:
     same Term objects (coefficient a Fraction, the tuples as parse_term builds them) either
     way."""
     if NATIVE and _native is not None:
-        return _native.parse_terms(text, n_nodes, Term, Fraction)
+        try:
+            return _native.parse_terms(text, n_nodes, Term, Fraction)
+        except ValueError as e:
+            if "overflow" not in str(e):
+                raise
+            # a coefficient beyond 128 bits (expansion orders above about 20; found on the
+            # June-2026 Sp2nf5 landscape at order 25): the Python parser, arbitrary precision
     return [parse_term(t, n_nodes) for t in text.split("+") if t]
 
 
