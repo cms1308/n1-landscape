@@ -92,7 +92,41 @@ def parse_group_rank(group_rank: str) -> Tuple[str, int]:
     return group_rank[0], int(group_rank[1:])
 
 
+try:                                            # the optional native extension (landscape_native, Rust)
+    import landscape_native as _native
+except ImportError:
+    _native = None
+
+# The native character engine answers the Adams/tensor lcode forms when the extension has it
+# and LANDSCAPE_NATIVE_LIE is not 0/off/no (on by default since its gate passed: byte-identical
+# to LiE on the R18 manifest and the stores, faster on every witness and on the cold pass); any
+# other lcode, and NotImplementedError from the engine, go to the LiE subprocess.
+NATIVE_LIE = (_native is not None and hasattr(_native, "lie_run")
+              and os.environ.get("LANDSCAPE_NATIVE_LIE", "1").strip().lower() not in ("0", "off", "no", ""))
+
+
+def native_lie_available() -> bool:
+    return _native is not None and hasattr(_native, "lie_run")
+
+
+def run_lie_native(lcode: str, timeout: float) -> str:
+    """The native engine's stdout for a supported lcode; NotImplementedError otherwise;
+    subprocess.TimeoutExpired past the timeout."""
+    return _native.lie_run(lcode, timeout)
+
+
 def run_lie(lcode: str, timeout: float) -> str:
+    """LiE's stdout for an lcode: the native engine when NATIVE_LIE is set and the form is
+    supported, else the LiE subprocess with the pipeline's kill semantics."""
+    if NATIVE_LIE:
+        try:
+            return _native.lie_run(lcode, timeout)
+        except NotImplementedError:
+            pass
+    return run_lie_subprocess(lcode, timeout)
+
+
+def run_lie_subprocess(lcode: str, timeout: float) -> str:
     """LiE subprocess with the pipeline's kill semantics."""
     proc = subprocess.Popen(
         ["lie"], shell=True,

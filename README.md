@@ -38,6 +38,38 @@ per gauge group, created automatically and filled on demand through LiE.
 pip install .
 ```
 
+## Optional native extension
+
+The package runs on Python alone. The `native/` directory holds an optional Rust extension,
+`landscape_native` (PyO3), that the package uses when it is importable:
+
+- the FORM-output parser and the combined expansion pass (parse, singlet lookups and the
+  field-resolved aggregation in one call);
+- the character-arithmetic engine (Adams operations and tensor products with LiE's output
+  format) in place of the LiE subprocess for the calls of the character store and the projector;
+- the expansion engine in place of the FORM run: the exponential of the single-letter series,
+  truncated as FORM truncates it.
+
+With the extension a record needs no FORM and no LiE subprocess. On the 51-theory reference
+sample of the development record the summed wall of the records fell from 263 s (the package
+before its speed work, FORM and LiE included) to 18 s with the extension; the changes to the
+Python path and to the FORM program alone account for about half of that fall. Every
+native function is checked against the pure-Python path, FORM or LiE on the same inputs and
+gives the same records; the pure-Python path stays the reference and the fallback (a program
+whose 128-bit coefficients overflow runs FORM; an lcode outside the engine's forms runs LiE).
+
+Build and install it with a Rust toolchain (`rustup`) and `maturin`:
+
+```bash
+pip install ./native
+```
+
+Switches (environment variables, read at import): `LANDSCAPE_NATIVE=0` selects the pure-Python
+parser and expansion, `LANDSCAPE_NATIVE_EXPAND=0` the term-level path with the native parser,
+`LANDSCAPE_NATIVE_FORM=0` the FORM run, `LANDSCAPE_NATIVE_LIE=0` the LiE subprocess,
+`LANDSCAPE_NATIVE_THREADS=n` the engines' thread count. Without the extension every switch is
+inert.
+
 ## Quick start
 
 ```python

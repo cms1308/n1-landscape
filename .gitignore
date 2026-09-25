@@ -11,3 +11,5 @@ runs/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+native/target/
+native/*.so

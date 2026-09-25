@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "landscape-native"
+version = "0.4.0"
+description = "Native (Rust) implementations of the measured hot spots of the landscape package; optional at import"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "landscape_native"

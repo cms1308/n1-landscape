@@ -435,10 +435,13 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
         res.unlisted, negative = _unlisted(fullscalar, wvars, w, cols, {})
         res.negative = operator_list(negative, cols)
     else:
-        letters = {k: c for m, _, _ in entries for k, c in coefficient_t(fullscalar, m).items()}
+        by_m: Dict[int, Poly] = {}           # the scalar part bucketed by exponent, one pass
+        for k, c in fullscalar.items():
+            by_m.setdefault(k[0], {})[k] = c
+        letters = {k: c for m in {m for m, _, _ in entries} for k, c in by_m[m].items()}
         rules = fterm_rules(letters, wvars, w)
         if entries[0][0] <= 2000:
-            block = apply_rules(coefficient_t(fullscalar, entries[0][0]), rules)
+            block = apply_rules(by_m[entries[0][0]], rules)
             chiral, negative = _split(_operators(block, cols))
             res.decoupled = operator_list(chiral, cols)
             res.negative = operator_list(negative, cols)
@@ -448,10 +451,20 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
             neutral = (0,) * len(basis)
             relevant: Dict[Vec, F] = {}
             flipped: Dict[Vec, F] = {}
+            # the substituted block of an exponent is computed once and split by (y, flavor) once;
+            # an entry reads its sub-block (the neutral y = 0 entry the whole block), the same
+            # dictionary the per-entry refilter produced -- that refilter was quadratic in the
+            # number of distinct flavor charges at an exponent
+            blocks: Dict[int, Tuple[Poly, Dict[Tuple[int, Vec], Poly]]] = {}
             for m, y, fl in entries:
-                block = apply_rules(coefficient_t(fullscalar, m), rules)
-                if y or fl != neutral:
-                    block = {k: c for k, c in block.items() if k[1] == y and flavor_of(k[2], basis) == fl}
+                if m not in blocks:
+                    sub = apply_rules(by_m[m], rules)
+                    groups: Dict[Tuple[int, Vec], Poly] = {}
+                    for k, c in sub.items():
+                        groups.setdefault((k[1], flavor_of(k[2], basis)), {})[k] = c
+                    blocks[m] = (sub, groups)
+                sub, groups = blocks[m]
+                block = groups.get((y, fl), {}) if (y or fl != neutral) else sub
                 ops = _operators(block, cols)
                 _merge(relevant, ops)
                 if m < 4000:
@@ -460,7 +473,7 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
             dim3 = 0
             coef_total = F(0)
             if has_six:
-                six = coefficient_t(fullscalar, 6000)
+                six = by_m.get(6000, {})
                 coef = w_to_one(apply_rules(six, fterm_rules(six, wvars, w)), w)
                 by_fields: Dict[Vec, F] = {}
                 for (_, _, v), c in coef.items():

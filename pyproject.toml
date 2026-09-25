@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n1-landscape"
-version = "0.1.0"
+version = "0.2.0"
 description = "Superconformal-index pipeline of the 4d N=1 SCFT landscape program for product gauge groups"
 readme = "README.md"
 license = { file = "LICENSE" }

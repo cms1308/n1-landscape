@@ -12,6 +12,7 @@ is used.
 """
 from __future__ import annotations
 
+import subprocess
 from fractions import Fraction as F
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -20,7 +21,8 @@ from . import form
 from .convert import index_string, reduce_index
 from .model import (CanonicalForm, FieldResolvedTerm, PhysicalTerm, Theory, canonical_flavor_basis, canonical_form,
                     project)
-from .singlet import ProductProjector, Term, parse_term, project_terms
+from . import singlet
+from .singlet import ProductProjector, Term, parse_term, parse_terms, project_terms
 from .store import LabelStore
 
 
@@ -35,6 +37,16 @@ def open_stores(th: Theory, store_dir: str | Path, lie_runner=None, create: bool
             kwargs = {"lie_runner": lie_runner} if lie_runner is not None else {}
             opened[g] = LabelStore(Path(store_dir) / f"charstore_{g}.sqlite", g, create=create, **kwargs)
         out.append(opened[g])
+    return out
+
+
+def field_resolved_native(rows) -> List[FieldResolvedTerm]:
+    """The rows of singlet.expand_native -> FieldResolvedTerms (integral coefficients, as
+    field_resolved asserts)."""
+    out = []
+    for num, den, milli, ypow, markers in rows:
+        assert den == 1, f"non-integral coefficient {num}/{den} at t^{milli / 1000} y^{ypow} {markers}"
+        out.append(FieldResolvedTerm(F(num), milli, ypow, markers))
     return out
 
 
@@ -74,13 +86,27 @@ class IndexEngine:
         """Field-resolved expansion through t^t_order; None on the "stop" of form.program
         or a FORM timeout."""
         assert len(th.nodes) == self.projector.n_nodes
+        if singlet.NATIVE_FORM:
+            series = form.itotal_terms(th, charges, t_order)
+            if series is None:                       # the stop of form.program
+                return None
+            try:
+                rows = singlet.expand_series_native(series, self.projector, form.FORM_TIMEOUT_S, self._match_timeout)
+                return field_resolved_native(rows)
+            except singlet.NativeOverflow:
+                pass                                 # the FORM path below
+            except subprocess.TimeoutExpired:
+                return None                          # as a FORM timeout
         source = form.program(th, charges, t_order)
         if source is None:
             return None
         out = self.runner.run(source, t_order)
         if out is None:
             return None
-        terms = [parse_term(t, len(th.nodes)) for t in out.split("+") if t]
+        if singlet.NATIVE_EXPAND:
+            return field_resolved_native(singlet.expand_native(out, len(th.nodes), th.n_fields(), t_order,
+                                                               self.projector, self._match_timeout))
+        terms = parse_terms(out, len(th.nodes))
         return field_resolved(project_terms(terms, self.projector, self._core, self._match_timeout),
                               th.n_fields(), t_order)
 
