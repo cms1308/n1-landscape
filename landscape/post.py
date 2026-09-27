@@ -18,6 +18,10 @@ that are conventions rather than derivations:
     whose powers all equal the term's powers is removed once; single-factor monomials are
     removed per factor otherwise.
 
+The superpotential `w` the rules read is `mass.effective_superpotential(w)`: the expansion has no letters of
+the fields a mass term makes massive, so the rules refer to the superpotential written in the remaining fields
+(the massive fields replaced by the solutions of their F-term equations); `w` itself without a mass term.
+
 Operator lists are sets: one entry per exponent vector, with the coefficient of the term
 as multiplicity (the old lists are ordered, may repeat an entry and drop the coefficient
 except for marginal operators).  A positive term with a negative power of a field is no
@@ -44,6 +48,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction as F
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from . import mass
 from .model import FieldResolvedTerm
 
 Vec = Tuple[int, ...]
@@ -400,7 +405,7 @@ def _setup(terms, basis, w, field_cols):
     else:
         n = native.n_fields
     cols = list(range(n)) if field_cols is None else list(field_cols)
-    return terms, cols, [dict(m) for m in w]
+    return terms, cols, mass.effective_superpotential(w)
 
 
 def decouple(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w: Sequence[Dict[int, int]],

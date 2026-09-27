@@ -155,6 +155,7 @@ Verdict classes (in the order they are tested): `gauge-anomaly`, `witten-anomaly
 | `store` | the character store: sqlite per group, entries generated on a miss by the Adams/tensor recursion through LiE |
 | `singlet` | FORM-output parser and the gauge-singlet projection for a product group |
 | `form` | the FORM program of the index and its runner (sequential `form` or `tform` by an automatic size policy) |
+| `mass` | the fields a mass term (a degree-two superpotential monomial) makes massive, and the superpotential written in the remaining fields |
 | `index` | the index engine: FORM -> projection -> field-resolved expansion -> physical index in the canonical flavor basis; renderers |
 | `post` | operator extraction, F-term substitution, consistency conditions C1/C2/C1'/C3/C4 |
 | `record` | one theory to one record, including the flips of decoupled operators; JSON lines I/O and schema validation |
@@ -174,6 +175,11 @@ Verdict classes (in the order they are tested): `gauge-anomaly`, `witten-anomaly
 - A positive index term with a negative power of a field (a fermion of a field outside
   the superpotential) is never an operator-list entry; it is reported under
   `analysis.negative_power_terms`.
+- The fields a **mass term** makes massive (a superpotential monomial of degree two, `a b` or `a^2`) are left out of the
+  index expansion: their letters cancel in the flavor-refined index, so the index, the identity and the central charges
+  are unchanged, and operators are named by the remaining fields through the superpotential with the massive fields
+  eliminated by their F-term equations (`mass.effective_superpotential`). The theory, its superpotential and the
+  a-maximization keep the massive fields. A remaining field at R = 0 or 2 ends the expansion as `index-not-computed`.
 - No descent to a lower expansion order: a theory whose expansion is not returned at the
   requested order is recorded as `index-not-computed`.
 - FORM's scratch files go to a per-process directory under the runner's work directory

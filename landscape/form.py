@@ -32,7 +32,9 @@ for the model:
 
 The j-range of a field is its own get_order (the original code used the maximum over the
 species); letters beyond the truncation are dropped by FORM, so the output through
-t^{t_order} is the same.
+t^{t_order} is the same.  The fields a mass term makes massive have no letters (their letters
+cancel in the flavor-refined index; `mass`), and the expansion order is that of the remaining
+fields; a remaining field at R = 0 or 2 stops the program like an order above MAX_ORDER.
 
 Scratch files: FORM's TempDir is a per-process
 directory under the runner's work directory (`-t`), never the current directory, and it
@@ -49,7 +51,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from . import lie
+from . import lie, mass
 from .convert import render_fraction
 from .model import Theory
 from .singlet import char_symbol
@@ -92,6 +94,22 @@ def get_order(t_order: int, r_list: Sequence) -> int:
     return math.ceil(max(l))
 
 
+def _orders(th: Theory, r_str: Sequence[str], t_order: int) -> Optional[Tuple[set, List[int], int, int]]:
+    """(massive fields, expansion order per field, vector order, max order), or None where the
+    expansion stops: an order above MAX_ORDER, or a remaining field at R = 0 or 2 (a letter at
+    t^0, which the truncation does not bound).  The fields a mass term makes massive
+    (mass.massive_fields) have no letters and no order."""
+    massive = set(mass.massive_fields(th.terms))
+    if any(Decimal(r) in (0, 2) for f, r in enumerate(r_str) if f not in massive):
+        return None
+    orders = [0 if f in massive else get_order(t_order, [r]) for f, r in enumerate(r_str)]
+    vec_order = get_order(t_order, [1])
+    max_order = max(orders + [vec_order])
+    if max_order > MAX_ORDER:
+        return None
+    return massive, orders, vec_order, max_order
+
+
 def marker(f: int) -> str:
     return f"f{f + 1}"
 
@@ -125,11 +143,10 @@ def program(th: Theory, charges: Sequence, t_order: int, scheme: str = "bounded"
         raise ValueError(f"unknown polyratfun {polyratfun!r}; one of {POLYRATFUN}")
     r_str = [charge_string(r) for r in charges]
     assert len(r_str) == th.n_fields(), "one R-charge per field"
-    orders = [get_order(t_order, [r]) for r in r_str]
-    vec_order = get_order(t_order, [1])
-    max_order = max(orders + [vec_order])
-    if max_order > MAX_ORDER:
+    stop = _orders(th, r_str, t_order)
+    if stop is None:
         return None
+    massive, orders, vec_order, max_order = stop
 
     def J(j):
         return "(" + "+".join(
@@ -153,6 +170,8 @@ def program(th: Theory, charges: Sequence, t_order: int, scheme: str = "bounded"
 
     terms = []
     for f, r in enumerate(r_str):
+        if f in massive:
+            continue
         r_val = Decimal(r)
         boson, fermion = encode(3 * r_val), encode(6 - 3 * r_val)
         for j in range(1, orders[f] + 1):
@@ -249,11 +268,10 @@ def itotal_terms(th: Theory, charges: Sequence, t_order: int) -> Optional[Series
     `program`), or None where `program` stops (max_order > MAX_ORDER)."""
     r_str = [charge_string(r) for r in charges]
     assert len(r_str) == th.n_fields(), "one R-charge per field"
-    orders = [get_order(t_order, [r]) for r in r_str]
-    vec_order = get_order(t_order, [1])
-    max_order = max(orders + [vec_order])
-    if max_order > MAX_ORDER:
+    stop = _orders(th, r_str, t_order)
+    if stop is None:
         return None
+    massive, orders, vec_order, max_order = stop
     t_limit = 500 * t_order
     n = th.n_fields()
     slots: List[Tuple[int, Tuple[int, ...], int]] = []
@@ -284,6 +302,8 @@ def itotal_terms(th: Theory, charges: Sequence, t_order: int) -> Optional[Series
             raw.append((coeff, (t, tsr[1] * j, tsr[2] * j, yj, tuple(f_exps), tuple(sorted(c_exps.items())))))
 
     for f, r in enumerate(r_str):
+        if f in massive:
+            continue
         r_val = Decimal(r)
         boson, fermion = encode(3 * r_val), encode(6 - 3 * r_val)
         for j in range(1, orders[f] + 1):
