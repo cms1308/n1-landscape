@@ -52,6 +52,7 @@ use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString, PyTuple};
 use std::collections::{BTreeMap, HashMap};
+use std::num::IntErrorKind;
 
 fn gcd(mut a: i128, mut b: i128) -> i128 {
     a = a.abs();
@@ -82,9 +83,15 @@ fn checked_mul(a: i128, b: i128) -> PyResult<i128> {
         .ok_or_else(|| PyValueError::new_err("coefficient overflow in the native parser"))
 }
 
+/// A literal outside the i128 range is a coefficient overflow (the callers fall back to the
+/// Python parser on "overflow"), anything else that is not an integer a bad literal.
 fn parse_i128(s: &str, what: &str, term: &str) -> PyResult<i128> {
-    s.parse::<i128>()
-        .map_err(|_| PyValueError::new_err(format!("bad {what} '{s}' in term '{term}'")))
+    s.parse::<i128>().map_err(|e| match e.kind() {
+        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => PyValueError::new_err(format!(
+            "coefficient overflow in the native parser: {what} '{s}' beyond 128 bits in term '{term}'"
+        )),
+        _ => PyValueError::new_err(format!("bad {what} '{s}' in term '{term}'")),
+    })
 }
 
 fn parse_i64(s: &str, what: &str, term: &str) -> PyResult<i64> {
@@ -417,6 +424,6 @@ fn landscape_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lie::lie_dim, m)?)?;
     m.add_function(wrap_pyfunction!(series::expand_series, m)?)?;
     m.add_class::<post::FieldResolvedRows>()?;
-    m.add("__version__", "0.6.0")?;
+    m.add("__version__", "0.6.1")?;
     Ok(())
 }
