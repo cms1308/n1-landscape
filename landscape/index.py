@@ -75,6 +75,12 @@ def field_resolved(records: Iterable[Tuple[Term, int]], n_fields: int, t_order: 
     return out
 
 
+def theory_key(th: Theory, charges: Sequence) -> tuple:
+    """The key of the theory an expansion is of (fields, superpotential terms, R-charges), which
+    FormRunner.run compares so that only the lower orders of the same theory select TFORM."""
+    return (repr(th.fields), repr(th.terms), tuple(str(r) for r in charges))
+
+
 class IndexEngine:
     """FORM runner + projector for one node list."""
 
@@ -111,7 +117,7 @@ class IndexEngine:
         source = form.program(th, charges, t_order)
         if source is None:
             return None
-        out = self.runner.run(source, t_order)
+        out = self.runner.run(source, t_order, key=theory_key(th, charges))
         if out is None:
             return None
         if singlet.NATIVE_EXPAND:

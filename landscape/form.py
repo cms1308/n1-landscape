@@ -381,7 +381,9 @@ class FormRunner:
     """Runs FORM programs in a work directory, with the inherited output cleaning and an
     automatic TFORM policy: an expansion runs under `tform -w<workers>` when the most recent
     lower-order output of this runner exceeded `threshold` bytes, sequentially otherwise
-    (workers = 0: always sequential)."""
+    (workers = 0: always sequential).  With a `key` naming the theory expanded, only an output
+    of the same key counts, so the command does not depend on another theory the runner
+    expanded before."""
 
     def __init__(self, workdir: str | Path, tform_workers: int = 4,
                  threshold: int = TFORM_THRESHOLD_BYTES, timeout: float = FORM_TIMEOUT_S):
@@ -390,7 +392,7 @@ class FormRunner:
         self._workers = tform_workers
         self._threshold = threshold
         self._timeout = timeout
-        self._last: Optional[Tuple[int, int]] = None      # (t_order, output bytes)
+        self._last: Optional[Tuple[int, int, object]] = None   # (t_order, output bytes, key)
         self.last_runner = None
         self.last_cleanup = 0                             # files removed after the last timeout
 
@@ -411,10 +413,13 @@ class FormRunner:
                     n += 1
         return n
 
-    def run(self, source: str, t_order: int) -> Optional[str]:
-        """Cleaned FORM output ('+'-separated terms), or None on a FORM timeout."""
+    def run(self, source: str, t_order: int, key=None) -> Optional[str]:
+        """Cleaned FORM output ('+'-separated terms), or None on a FORM timeout.  `key`: the
+        theory the program expands (IndexEngine.expansion passes one); None reads the most recent
+        output whatever its key."""
         heavy = (self._workers > 0 and self._last is not None
-                 and self._last[0] < t_order and self._last[1] > self._threshold)
+                 and self._last[0] < t_order and self._last[1] > self._threshold
+                 and (key is None or self._last[2] == key))
         frm = self._dir / f"index{os.getpid()}.frm"
         frm.write_text(source)
         tmp = self.tempdir()
@@ -429,5 +434,5 @@ class FormRunner:
             frm.unlink(missing_ok=True)
         out = (res.stdout.strip().replace("result", "").replace(" ", "").replace("=", "")
                .replace("\n", "").replace("z", "1").replace("\\", ""))[:-1]
-        self._last = (t_order, len(out))
+        self._last = (t_order, len(out), key)
         return out
