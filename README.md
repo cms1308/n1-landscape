@@ -180,6 +180,12 @@ Verdict classes (in the order they are tested): `gauge-anomaly`, `witten-anomaly
   are unchanged, and operators are named by the remaining fields through the superpotential with the massive fields
   eliminated by their F-term equations (`mass.effective_superpotential`). The theory, its superpotential and the
   a-maximization keep the massive fields. A remaining field at R = 0 or 2 ends the expansion as `index-not-computed`.
+- The **F-term substitution** of the operator extraction pairs each fermion term (a relation dW/df = 0 among the bosons
+  of its block) with a boson term present in the block, by a maximum matching over the monomials of dW/df, the first
+  superpotential monomial tried first (`post.FTERM_RULE`, "first" for the original rule, which always takes it); a
+  bin where the index lies below the number of listed operators then holds a genuine fermionic operator.
+- The plethystic expansion stops above order 100 (`form.MAX_ORDER`; 40 in the original code), recording
+  `index-not-computed`; the FORM timeout is 600 s.
 - No descent to a lower expansion order: a theory whose expansion is not returned at the
   requested order is recorded as `index-not-computed`.
 - FORM's scratch files go to a per-process directory under the runner's work directory

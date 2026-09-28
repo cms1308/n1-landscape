@@ -14,6 +14,9 @@ that are conventions rather than derivations:
     coefficient at (E, flavor) or at (E, neutral) (the old NumberQ branch); the positive
     terms this rule leaves out (a boson whose index contribution is cancelled by a fermionic
     term that no F-term substitution removes) are returned as `unlisted`;
+  * the F-term substitution (`apply_fterm`): a fermion factor f^j becomes (m/f)^(-j); the inherited rule takes
+    m the first superpotential monomial containing f (FTERM_RULE "first"), the default takes, per term with a
+    negative coefficient, the first m whose product is a positive term of the block not yet used up;
   * `Thread[w -> 1]` at t^6: the first superpotential monomial of two or more factors
     whose powers all equal the term's powers is removed once; single-factor monomials are
     removed per factor otherwise.
@@ -44,6 +47,7 @@ pass, runs the Python functions, which remain the reference.
 """
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from fractions import Fraction as F
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -218,6 +222,92 @@ def apply_rules(poly: Poly, rules: Rules) -> Poly:
     return out
 
 
+FTERM_RULE = "block"                    # "first": the inherited rule, set only by check scripts as a comparison baseline
+
+
+def _image(v: Vec, choice: Dict[int, Dict[int, int]]) -> Vec:
+    """`v` with the factor f^e of every field f in `choice` replaced by choice[f] (the substitution of apply_rules)."""
+    d = list(v)
+    extra: Dict[int, int] = {}
+    for f, rep in choice.items():
+        d[f] = 0
+        for k, p in rep.items():
+            extra[k] = extra.get(k, 0) + p
+    for k, p in extra.items():
+        d[k] += p
+    return tuple(d)
+
+
+def apply_fterm(poly: Poly, rules: Rules, w: Sequence[Dict[int, int]]) -> Poly:
+    """The F-term substitution of a block.  With FTERM_RULE "first", `apply_rules`: a fermion factor f^j
+    becomes (m/f)^(-j) with m the first superpotential monomial containing f.  With "block" (the default),
+    the terms with a negative coefficient (one slot per unit) are matched to the positive boson terms of the
+    block (one slot per unit of their coefficient) through their candidate images -- per field with a rule,
+    the monomials of `w` containing it, in order -- by a maximum matching (augmenting paths, the slots in
+    sorted order, the candidates in that order); an unmatched slot takes the image of `apply_rules`, and a
+    term with a positive coefficient takes the image of `apply_rules`.  The first
+    monomial's product can be absent from the block (no gauge singlet), and its fermion then cancels
+    nothing; another monomial of dW/df can have its product present."""
+    if FTERM_RULE == "first" or not rules:
+        return apply_rules(poly, rules)
+    out: Poly = {}
+    avail: Dict[Key, F] = {}
+    pending = []
+    for (m, y, v), c in poly.items():
+        ruled = [f for f, e in enumerate(v) if e and (f, e) in rules]
+        if ruled and c < 0:
+            pending.append(((m, y, v), c, ruled))
+            continue
+        k = (m, y, _image(v, {f: rules[(f, v[f])] for f in ruled}) if ruled else v)
+        _add(out, k, c)
+        if c > 0 and all(e >= 0 for e in k[2]):
+            avail[k] = avail.get(k, 0) + c
+    # a maximum matching of the fermion terms (one slot per unit of coefficient) to the available boson terms
+    # (capacity = coefficient), candidates in the order above: augmenting paths, the slots in sorted order
+    slots, cands = [], []
+    for (m, y, v), c, ruled in sorted(pending, key=lambda t: t[0]):
+        options = []
+        for f in ruled:
+            j = v[f]
+            reps = []
+            for mono in w:
+                if f in mono:
+                    rep = {k: p * (-j) for k, p in mono.items()}
+                    rep[f] = rep.get(f, 0) + j
+                    reps.append(rep)
+            options.append(reps)
+        images = []
+        for combo in itertools.product(*options):
+            k = (m, y, _image(v, dict(zip(ruled, combo))))
+            if avail.get(k, 0) > 0 and k not in images:
+                images.append(k)
+        fallback = (m, y, _image(v, {f: rules[(f, v[f])] for f in ruled}))
+        for _ in range(int(-c)):
+            slots.append(fallback)
+            cands.append(images)
+    # one node per unit of a boson term's coefficient; Kuhn's augmenting paths
+    nodes = [[(k, n) for k in images for n in range(int(avail[k]))] for images in cands]
+    taken: Dict[Tuple[Key, int], int] = {}
+    match: List[Optional[Key]] = [None] * len(slots)
+
+    def augment(s_, seen) -> bool:
+        for node in nodes[s_]:
+            if node in seen:
+                continue
+            seen.add(node)
+            if node not in taken or augment(taken[node], seen):
+                taken[node] = s_
+                match[s_] = node[0]
+                return True
+        return False
+
+    for s_ in range(len(slots)):
+        augment(s_, set())
+    for s_, fallback in enumerate(slots):
+        _add(out, match[s_] if match[s_] is not None else fallback, F(-1))
+    return out
+
+
 def w_to_one(poly: Poly, w: Sequence[Dict[int, int]]) -> Poly:
     products = [m for m in w if len(m) >= 2]
     singles = [m for m in w if len(m) == 1]
@@ -288,7 +378,7 @@ def _unlisted(fullscalar: Poly, wvars, w, cols, relevant: Dict[Vec, F]):
     rules = fterm_rules(below, wvars, w)
     positive: Dict[Vec, F] = {}
     for m in sorted({k[0] for k in below}):
-        _merge(positive, _operators(apply_rules(coefficient_t(below, m), rules), cols))
+        _merge(positive, _operators(apply_fterm(coefficient_t(below, m), rules, w), cols))
     chiral, negative = _split(positive)
     return operator_list({k: c for k, c in chiral.items() if k not in relevant}, cols), negative
 
@@ -439,7 +529,7 @@ def decouple(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]],
     letters = {k: c for e in set(exponents) for k, c in coefficient_t(scalars, e).items()}
     rules = fterm_rules(letters, cols, w)
     if exponents[0] <= 2000:
-        block = apply_rules(coefficient_t(scalars, exponents[0]), rules)
+        block = apply_fterm(coefficient_t(scalars, exponents[0]), rules, w)
         chiral, negative = _split(_operators(block, cols))
         res.decoupled = operator_list(chiral, cols)
         res.negative = operator_list(negative, cols)
@@ -534,7 +624,7 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
         letters = {k: c for m in {m for m, _, _ in entries} for k, c in by_m[m].items()}
         rules = fterm_rules(letters, wvars, w)
         if entries[0][0] <= 2000:
-            block = apply_rules(by_m[entries[0][0]], rules)
+            block = apply_fterm(by_m[entries[0][0]], rules, w)
             chiral, negative = _split(_operators(block, cols))
             res.decoupled = operator_list(chiral, cols)
             res.negative = operator_list(negative, cols)
@@ -551,7 +641,7 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
             blocks: Dict[int, Tuple[Poly, Dict[Tuple[int, Vec], Poly]]] = {}
             for m, y, fl in entries:
                 if m not in blocks:
-                    sub = apply_rules(by_m[m], rules)
+                    sub = apply_fterm(by_m[m], rules, w)
                     groups: Dict[Tuple[int, Vec], Poly] = {}
                     for k, c in sub.items():
                         groups.setdefault((k[1], flavor_of(k[2], basis)), {})[k] = c
@@ -567,7 +657,7 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
             coef_total = F(0)
             if has_six:
                 six = by_m.get(6000, {})
-                coef = w_to_one(apply_rules(six, fterm_rules(six, wvars, w)), w)
+                coef = w_to_one(apply_fterm(six, fterm_rules(six, wvars, w), w), w)
                 by_fields: Dict[Vec, F] = {}
                 for (_, _, v), c in coef.items():
                     key = tuple(v[f] for f in cols)

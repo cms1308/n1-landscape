@@ -13,7 +13,7 @@ for the model:
   * inherited from the original code: the exponent encoding t^p -> t^{int(500p)} s^{d1} r^{d2}
     with base-5000 digits (`encode`, the arithmetic of `single` at the default Decimal
     context), the truncation `t(: 500 t_order)`, the expansion orders (`get_order`), the
-    `max_order > 40` stop and the descendant factor sum_{a,b <= vec_order} (t^3 y)^a (t^3/y)^b;
+    `max_order > MAX_ORDER` stop (40 in the original code, 100 here) and the descendant factor sum_{a,b <= vec_order} (t^3 y)^a (t^3/y)^b;
   * the exponential as the loop z -> 1 + z itotal / i, i = 2..max_order, with a degree
     bound (`scheme="bounded"`, the default): a term whose t-power lies in block k
     (500 k <= power <= 500 k + 499) is multiplied only by itotal<m>, m = t_order - k, the
@@ -56,7 +56,7 @@ from .convert import render_fraction
 from .model import Theory
 from .singlet import char_symbol
 
-MAX_ORDER = 40
+MAX_ORDER = 100                 # the stop of the expansion order (40 in the original code)
 FORM_TIMEOUT_S = 600
 TFORM_THRESHOLD_BYTES = 2000
 
