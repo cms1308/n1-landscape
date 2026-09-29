@@ -1,6 +1,6 @@
 [package]
 name = "landscape_native"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Native (Rust) implementations of the measured hot spots of the landscape package; optional at import"
 license = "MIT"
@@ -10,8 +10,9 @@ name = "landscape_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module", "num-bigint"] }
 num-bigint = "0.4"
+num-integer = "0.1"
 num-traits = "0.2"
 rayon = "1"
 rustc-hash = "2"

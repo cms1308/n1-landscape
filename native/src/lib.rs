@@ -424,6 +424,6 @@ fn landscape_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lie::lie_dim, m)?)?;
     m.add_function(wrap_pyfunction!(series::expand_series, m)?)?;
     m.add_class::<post::FieldResolvedRows>()?;
-    m.add("__version__", "0.6.1")?;
+    m.add("__version__", "0.7.0")?;
     Ok(())
 }

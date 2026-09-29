@@ -3,8 +3,10 @@
 //! in place of the FORM run -- the same polynomial FORM prints as `result`.
 //!
 //! A monomial is an exponent vector [t, s, r, y, f_1..f_n, c_1..c_m] (`form.Series`); the
-//! product of two monomials adds the vectors; a coefficient is a reduced 128-bit rational
-//! (an overflow raises, and the caller falls back to FORM).  With P_1 = itotal and
+//! product of two monomials adds the vectors; a coefficient is a reduced 128-bit rational, and
+//! when one overflows the same expansion runs again with arbitrary-precision rationals (step 54;
+//! the factors 1/k give denominators of the order of k!, beyond 128 bits above an expansion order
+//! of about 25-34).  With P_1 = itotal and
 //! P_k = P_{k-1} itotal / k, the result is 1 + sum_k P_k for k = 1..max_order, every product
 //! whose t-power exceeds the limit dropped before it is formed (the terms of itotal sorted by
 //! t-power, the multiplication of a term of P_{k-1} stopping at the bound) -- the products FORM's
@@ -38,6 +40,9 @@
 //! the projector's `multiplicity`, coefficient x multiplicity summed per (milli, y power, markers)
 //! or per (milli, y power, flavor).
 
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -49,8 +54,11 @@ use std::time::Instant;
 
 type Exps = Vec<i32>;
 type Coef = (i128, i128);
-type Term = (Exps, Coef);
-type Map = FxHashMap<Exps, Coef>;
+type Term<C> = (Exps, C);
+type Map<C> = FxHashMap<Exps, C>;
+
+/// The overflow of a 128-bit coefficient: the expansion runs again with `Big`.
+const COEF_OVERFLOW: &str = "coefficient overflow";
 
 // --------------------------------------------------------------------------- //
 // coefficients
@@ -145,6 +153,129 @@ fn add(a: Coef, b: Coef, fast: bool) -> Result<Coef, String> {
     reduce(n, d, fast)
 }
 
+/// The coefficient arithmetic of the engine: a reduced rational of two `i128` (`Coef`, checked, an
+/// overflow raising COEF_OVERFLOW) or of two `BigInt` (`Big`).  `fast` is the `coef64` route of the
+/// 128-bit arithmetic (step 44); `Big` ignores it.
+pub(crate) trait Coeff: Clone + Send + Sync {
+    fn from_pair(n: i128, d: i128) -> Result<Self, String>;
+    fn one() -> Self;
+    fn is_zero(&self) -> bool;
+    fn times(&self, b: &Self, fast: bool) -> Result<Self, String>;
+    fn plus(&self, b: &Self, fast: bool) -> Result<Self, String>;
+    fn over(&self, k: i128, fast: bool) -> Result<Self, String>;
+    fn times_int(&self, m: i128) -> Result<Self, String>;
+    /// The value as two `i128`, or COEF_OVERFLOW.
+    fn pair(&self) -> Result<Coef, String>;
+    fn big(&self) -> (BigInt, BigInt);
+}
+
+fn coef_overflow<E>(_: E) -> String {
+    COEF_OVERFLOW.to_string()
+}
+
+impl Coeff for Coef {
+    #[inline]
+    fn from_pair(n: i128, d: i128) -> Result<Self, String> {
+        reduce(n, d, false)
+    }
+    #[inline]
+    fn one() -> Self {
+        (1, 1)
+    }
+    #[inline]
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+    #[inline]
+    fn times(&self, b: &Self, fast: bool) -> Result<Self, String> {
+        mul(*self, *b, fast).map_err(coef_overflow)
+    }
+    #[inline]
+    fn plus(&self, b: &Self, fast: bool) -> Result<Self, String> {
+        add(*self, *b, fast).map_err(coef_overflow)
+    }
+    #[inline]
+    fn over(&self, k: i128, fast: bool) -> Result<Self, String> {
+        let d = self.1.checked_mul(k).ok_or(COEF_OVERFLOW)?;
+        reduce(self.0, d, fast)
+    }
+    #[inline]
+    fn times_int(&self, m: i128) -> Result<Self, String> {
+        mul(*self, (m, 1), false).map_err(coef_overflow)
+    }
+    #[inline]
+    fn pair(&self) -> Result<Coef, String> {
+        Ok(*self)
+    }
+    fn big(&self) -> (BigInt, BigInt) {
+        (BigInt::from(self.0), BigInt::from(self.1))
+    }
+}
+
+/// An arbitrary-precision reduced rational (denominator positive).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Big {
+    n: BigInt,
+    d: BigInt,
+}
+
+impl Big {
+    fn reduced(mut n: BigInt, mut d: BigInt) -> Result<Big, String> {
+        if d.is_zero() {
+            return Err("zero denominator".into());
+        }
+        if n.is_zero() {
+            return Ok(Big { n, d: BigInt::one() });
+        }
+        let g = n.gcd(&d);
+        if !g.is_one() {
+            n /= &g;
+            d /= &g;
+        }
+        if d.is_negative() {
+            n = -n;
+            d = -d;
+        }
+        Ok(Big { n, d })
+    }
+}
+
+impl Coeff for Big {
+    fn from_pair(n: i128, d: i128) -> Result<Self, String> {
+        Big::reduced(BigInt::from(n), BigInt::from(d))
+    }
+    fn one() -> Self {
+        Big { n: BigInt::one(), d: BigInt::one() }
+    }
+    fn is_zero(&self) -> bool {
+        self.n.is_zero()
+    }
+    fn times(&self, b: &Self, _fast: bool) -> Result<Self, String> {
+        Big::reduced(&self.n * &b.n, &self.d * &b.d)
+    }
+    fn plus(&self, b: &Self, _fast: bool) -> Result<Self, String> {
+        if self.d == b.d {
+            return Big::reduced(&self.n + &b.n, self.d.clone());
+        }
+        Big::reduced(&self.n * &b.d + &b.n * &self.d, &self.d * &b.d)
+    }
+    fn over(&self, k: i128, _fast: bool) -> Result<Self, String> {
+        Big::reduced(self.n.clone(), &self.d * BigInt::from(k))
+    }
+    fn times_int(&self, m: i128) -> Result<Self, String> {
+        Big::reduced(&self.n * BigInt::from(m), self.d.clone())
+    }
+    fn pair(&self) -> Result<Coef, String> {
+        match (self.n.to_i128(), self.d.to_i128()) {
+            (Some(n), Some(d)) => Ok((n, d)),
+            _ => Err(COEF_OVERFLOW.to_string()),
+        }
+    }
+    fn big(&self) -> (BigInt, BigInt) {
+        (self.n.clone(), self.d.clone())
+    }
+}
+
 fn check_deadline(deadline: Option<Instant>) -> Result<(), String> {
     if let Some(d) = deadline {
         if Instant::now() > d {
@@ -154,11 +285,11 @@ fn check_deadline(deadline: Option<Instant>) -> Result<(), String> {
     Ok(())
 }
 
-fn merge_into(into: &mut Map, from: Map, fast: bool) -> Result<(), String> {
+fn merge_into<C: Coeff>(into: &mut Map<C>, from: Map<C>, fast: bool) -> Result<(), String> {
     for (k, c) in from {
         match into.get_mut(&k) {
             Some(e) => {
-                *e = add(*e, c, fast)?;
+                *e = e.plus(&c, fast)?;
             }
             None => {
                 into.insert(k, c);
@@ -251,20 +382,20 @@ impl Layout {
 
 /// The two lists of a power (or of itotal): field-resolved terms and flavor-refined terms, the
 /// former with their flavor images (computed once per term) when a basis is set.
-struct Power {
-    fr: Vec<Term>,
+struct Power<C> {
+    fr: Vec<Term<C>>,
     fr_flavor: Vec<Exps>,
     fr_n: Vec<i64>,      // the scaled weights of the field-resolved terms (the letters; a power's are computed per row)
-    fl: Vec<Term>,
+    fl: Vec<Term<C>>,
     fl_n: Vec<i64>,
 }
 
-struct Maps {
-    fr: Map,
-    fl: Map,
+struct Maps<C> {
+    fr: Map<C>,
+    fl: Map<C>,
 }
 
-impl Maps {
+impl<C> Maps<C> {
     fn new() -> Self {
         Maps { fr: FxHashMap::default(), fl: FxHashMap::default() }
     }
@@ -274,10 +405,10 @@ impl Maps {
 }
 
 #[inline]
-fn insert(map: &mut Map, key: &Exps, c: Coef, fast: bool) -> Result<(), String> {
+fn insert<C: Coeff>(map: &mut Map<C>, key: &Exps, c: C, fast: bool) -> Result<(), String> {
     match map.get_mut(key) {
         Some(e) => {
-            *e = add(*e, c, fast)?;
+            *e = e.plus(&c, fast)?;
         }
         None => {
             map.insert(key.clone(), c);
@@ -291,8 +422,8 @@ fn insert(map: &mut Map, key: &Exps, c: Coef, fast: bool) -> Result<(), String> 
 /// "__capacity__" before the merge (the guard of Q-6.6, on the sum instead of a per-chunk share:
 /// the field-resolved and flavor-refined lists of the projection make the chunks unequal).
 #[allow(clippy::too_many_arguments)]
-fn products(rows: &[Term], rows_flavor: &[Exps], rows_fr: bool, itotal: &Power, layout: &Layout, t_limit: i32,
-            deadline: Option<Instant>, cap: usize, live: &AtomicUsize) -> Result<Maps, String> {
+fn products<C: Coeff>(rows: &[Term<C>], rows_flavor: &[Exps], rows_fr: bool, itotal: &Power<C>, layout: &Layout, t_limit: i32,
+                      deadline: Option<Instant>, cap: usize, live: &AtomicUsize) -> Result<Maps<C>, String> {
     check_deadline(deadline)?;
     let mut reported = 0usize;
     let n = layout.n_fields;
@@ -332,7 +463,7 @@ fn products(rows: &[Term], rows_flavor: &[Exps], rows_fr: bool, itotal: &Power, 
                     continue;
                 }
             }
-            let c = mul(*cp, *ci, fast)?;
+            let c = cp.times(ci, fast)?;
             if rows_fr && (layout.basis.is_none() || n_p < layout.above_n) {
                 for j in 0..width_fr {
                     key_fr[j] = ep[j] + ei[j];
@@ -361,7 +492,7 @@ fn products(rows: &[Term], rows_flavor: &[Exps], rows_fr: bool, itotal: &Power, 
             if layout.exact && n_ep + itotal.fl_n[j] >= layout.limit_n {
                 continue;
             }
-            let c = mul(*cp, *ci, fast)?;
+            let c = cp.times(ci, fast)?;
             for j in 0..width_fl {
                 key_fl[j] = if j < 4 { ep[j] + ei[j] } else if j < 4 + r { ep_flavor[j - 4] + ei[j] } else { ep_chars[j - 4 - r] + ei[j] };
             }
@@ -374,12 +505,13 @@ fn products(rows: &[Term], rows_flavor: &[Exps], rows_fr: bool, itotal: &Power, 
 /// P_{k-1} x itotal with the t-bound, divided by k.  The deadline is checked every 256 rows of
 /// every chunk and at every merge; the chunks together past twice the cap during the step, or
 /// past the cap after it, stop with "__capacity__" before the merge.
-fn step(prev: &Power, itotal: &Power, layout: &Layout, t_limit: i32, k: i128, deadline: Option<Instant>, cap: usize) -> Result<Maps, String> {
+fn step<C: Coeff>(prev: &Power<C>, itotal: &Power<C>, layout: &Layout, t_limit: i32, k: i128, deadline: Option<Instant>,
+                  cap: usize) -> Result<Maps<C>, String> {
     let total = prev.fr.len() + prev.fl.len();
     let chunk = ((total + 63) / 64).max(64);
     let fast = layout.fast;
     let live = AtomicUsize::new(0);
-    let parts_fr: Vec<Maps> = prev.fr
+    let parts_fr: Vec<Maps<C>> = prev.fr
         .par_chunks(chunk)
         .enumerate()
         .map(|(i, rows)| {
@@ -387,7 +519,7 @@ fn step(prev: &Power, itotal: &Power, layout: &Layout, t_limit: i32, k: i128, de
             products(rows, flav, true, itotal, layout, t_limit, deadline, cap, &live)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let parts_fl: Vec<Maps> = prev.fl
+    let parts_fl: Vec<Maps<C>> = prev.fl
         .par_chunks(chunk)
         .map(|rows| products(rows, &[], false, itotal, layout, t_limit, deadline, cap, &live))
         .collect::<Result<Vec<_>, String>>()?;
@@ -400,7 +532,7 @@ fn step(prev: &Power, itotal: &Power, layout: &Layout, t_limit: i32, k: i128, de
     let merged = parts
         .into_par_iter()
         .map(Ok)
-        .reduce(|| Ok(Maps::new()), |a: Result<Maps, String>, b| {
+        .reduce(|| Ok(Maps::new()), |a: Result<Maps<C>, String>, b| {
             check_deadline(deadline)?;
             let mut a = a?;
             let mut b = b?;
@@ -418,36 +550,34 @@ fn step(prev: &Power, itotal: &Power, layout: &Layout, t_limit: i32, k: i128, de
     for (src, dst) in [(merged.fr, &mut out.fr), (merged.fl, &mut out.fl)] {
         dst.reserve(src.len());
         for (key, c) in src {
-            if c.0 == 0 {
+            if c.is_zero() {
                 continue;
             }
-            let d = c.1.checked_mul(k).ok_or("overflow")?;
-            let r = reduce(c.0, d, fast)?;
-            dst.insert(key, r);
+            dst.insert(key, c.over(k, fast)?);
         }
     }
     Ok(out)
 }
 
-fn power_of(maps: Maps, layout: &Layout) -> Result<Power, String> {
-    let fr: Vec<Term> = maps.fr.into_iter().collect();
+fn power_of<C: Coeff>(maps: Maps<C>, layout: &Layout) -> Result<Power<C>, String> {
+    let fr: Vec<Term<C>> = maps.fr.into_iter().collect();
     let fr_flavor = if layout.basis.is_some() { fr.iter().map(|(e, _)| layout.flavor(e)).collect::<Result<Vec<_>, String>>()? } else { Vec::new() };
     Ok(Power { fr, fr_flavor, fr_n: Vec::new(), fl: maps.fl.into_iter().collect(), fl_n: Vec::new() })
 }
 
 /// The truncated exponential: {monomial: coefficient} of the two kinds, the constant term included.
-fn exponential(terms: &[Term], t_limit: i32, max_order: usize, layout: &Layout, deadline: Option<Instant>) -> Result<Maps, String> {
+fn exponential<C: Coeff>(terms: &[Term<C>], t_limit: i32, max_order: usize, layout: &Layout, deadline: Option<Instant>) -> Result<Maps<C>, String> {
     let trace = std::env::var("LANDSCAPE_NATIVE_TRACE").is_ok();
     let fast = layout.fast;
     // itotal: the terms within the limit, sorted by t-power, in two lists when a basis is set
-    let mut itotal_fr: Vec<Term> = Vec::new();
-    let mut itotal_fl: Vec<Term> = Vec::new();
+    let mut itotal_fr: Vec<Term<C>> = Vec::new();
+    let mut itotal_fl: Vec<Term<C>> = Vec::new();
     for (e, c) in terms.iter().filter(|(e, _)| e[0] <= t_limit) {
         let above = layout.basis.is_some() && milli_exponent(e[0] as i64, e[1] as i64, e[2] as i64) as i64 > layout.project_above;
         if above {
-            itotal_fl.push((layout.to_flavor(e)?, *c));
+            itotal_fl.push((layout.to_flavor(e)?, c.clone()));
         } else {
-            itotal_fr.push((e.clone(), *c));
+            itotal_fr.push((e.clone(), c.clone()));
         }
     }
     itotal_fr.sort_by_key(|(e, _)| e[0]);
@@ -458,7 +588,7 @@ fn exponential(terms: &[Term], t_limit: i32, max_order: usize, layout: &Layout, 
     let itotal = Power { fr: itotal_fr, fr_flavor: itotal_fr_flavor, fr_n: itotal_fr_n, fl: itotal_fl, fl_n: itotal_fl_n };
     let width_fr = 4 + layout.n_fields + layout.n_slots;
     let mut result = Maps::new();
-    result.fr.insert(vec![0; width_fr], (1, 1));
+    result.fr.insert(vec![0; width_fr], C::one());
     let mut power = Power { fr: itotal.fr.clone(), fr_flavor: itotal.fr_flavor.clone(), fr_n: Vec::new(), fl: itotal.fl.clone(), fl_n: Vec::new() };
     let cap = capacity();
     for k in 1..=max_order {
@@ -484,18 +614,18 @@ fn exponential(terms: &[Term], t_limit: i32, max_order: usize, layout: &Layout, 
                 }
                 match dst.get_mut(e) {
                     Some(x) => {
-                        *x = add(*x, *c, fast)?;
+                        *x = x.plus(c, fast)?;
                     }
                     None => {
-                        dst.insert(e.clone(), *c);
+                        dst.insert(e.clone(), c.clone());
                     }
                 }
             }
         }
         check_deadline(deadline)?;
     }
-    result.fr.retain(|_, c| c.0 != 0);
-    result.fl.retain(|_, c| c.0 != 0);
+    result.fr.retain(|_, c| !c.is_zero());
+    result.fl.retain(|_, c| !c.is_zero());
     Ok(result)
 }
 
@@ -558,44 +688,93 @@ pub fn expand_series<'py>(
     if basis.is_some() && (monomials || !native_rows) {
         return Err(PyValueError::new_err("a flavor basis needs native rows (the rows above t^6 are flavor-refined)"));
     }
-    let mut series: Vec<Term> = Vec::with_capacity(terms.len());
-    for (n, d, e) in terms {
+    for (_, _, e) in terms.iter() {
         if e.len() != width {
             return Err(PyValueError::new_err("exponent vector of the wrong length"));
         }
-        series.push((e, reduce(n, d, false).map_err(PyValueError::new_err)?));
     }
     let limit: i64 = 1000 * t_order;
     let layout = Layout { n_fields, n_slots: slots.len(), rank: basis.as_ref().map(|b| b.len()).unwrap_or(0), basis,
                           project_above: 6000, above_n: threshold_n(6000), limit_n: threshold_n(limit), exact, fast: coef64 };
     crate::lie::init_pool();
+    let trace = std::env::var("LANDSCAPE_NATIVE_TRACE").is_ok();
     let t_exp = Instant::now();
-    let result = py.allow_threads(|| exponential(&series, t_limit, max_order, &layout, deadline));
-    if std::env::var("LANDSCAPE_NATIVE_TRACE").is_ok() {
+    // the 128-bit engine first; on a coefficient overflow the same expansion with arbitrary precision (step 54)
+    let small = py.allow_threads(|| series_of::<Coef>(&terms).and_then(|s| exponential(&s, t_limit, max_order, &layout, deadline)));
+    let out = match small {
+        // the 128-bit rows' sums may overflow where the expansion did not: the rows again from the same expansion, exactly
+        Ok(r) => match finish(py, &r, monomials, native_rows, &layout, &slots, n_nodes, n_fields, limit, &lookup) {
+            Err(e) if e.to_string().contains(COEF_OVERFLOW) => {
+                let r = to_big(&r).map_err(PyValueError::new_err)?;
+                finish(py, &r, monomials, native_rows, &layout, &slots, n_nodes, n_fields, limit, &lookup)
+            }
+            other => other,
+        },
+        Err(m) if m == COEF_OVERFLOW => {
+            if trace {
+                eprintln!("[series] 128-bit overflow after {:.3} s: arbitrary precision", t_exp.elapsed().as_secs_f64());
+            }
+            let big = py.allow_threads(|| series_of::<Big>(&terms).and_then(|s| exponential(&s, t_limit, max_order, &layout, deadline)));
+            match big {
+                Ok(r) => finish(py, &r, monomials, native_rows, &layout, &slots, n_nodes, n_fields, limit, &lookup),
+                Err(m) => Err(engine_error(py, m, timeout)),
+            }
+        }
+        Err(m) => Err(engine_error(py, m, timeout)),
+    };
+    if trace {
         eprintln!("[series] exponential {:.3} s", t_exp.elapsed().as_secs_f64());
     }
-    let result = match result {
-        Ok(r) => r,
-        Err(m) if m == "__timeout__" => return Err(timeout_error(py, timeout)),
-        Err(m) if m == "__capacity__" => {
-            return Err(PyValueError::new_err(format!("capacity: the expansion exceeds {} monomials (LANDSCAPE_NATIVE_MAX_TERMS)", capacity())))
+    out
+}
+
+fn to_big<C: Coeff>(m: &Maps<C>) -> Result<Maps<Big>, String> {
+    let conv = |src: &Map<C>| -> Result<Map<Big>, String> {
+        let mut out: Map<Big> = FxHashMap::default();
+        out.reserve(src.len());
+        for (e, c) in src {
+            let (n, d) = c.big();
+            out.insert(e.clone(), Big::reduced(n, d)?);
         }
-        Err(m) => return Err(PyValueError::new_err(m)),
+        Ok(out)
     };
+    Ok(Maps { fr: conv(&m.fr)?, fl: conv(&m.fl)? })
+}
+
+fn series_of<C: Coeff>(terms: &[(i128, i128, Vec<i32>)]) -> Result<Vec<Term<C>>, String> {
+    terms.iter().map(|(n, d, e)| Ok((e.clone(), C::from_pair(*n, *d)?))).collect()
+}
+
+fn engine_error(py: Python<'_>, m: String, timeout: Option<f64>) -> PyErr {
+    if m == "__timeout__" {
+        return timeout_error(py, timeout);
+    }
+    if m == "__capacity__" {
+        return PyValueError::new_err(format!("capacity: the expansion exceeds {} monomials (LANDSCAPE_NATIVE_MAX_TERMS)", capacity()));
+    }
+    PyValueError::new_err(m)
+}
+
+/// The polynomial (monomials) or the rows of the two kinds from the truncated exponential.
+#[allow(clippy::too_many_arguments)]
+fn finish<'py, C: Coeff>(py: Python<'py>, result: &Maps<C>, monomials: bool, native_rows: bool, layout: &Layout,
+                          slots: &[(usize, Vec<i64>, i64)], n_nodes: usize, n_fields: usize, limit: i64,
+                          lookup: &Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
     if monomials {
         let out = PyList::empty(py);
-        let mut rows: Vec<(&Exps, &Coef)> = result.fr.iter().collect();
-        rows.sort();
+        let mut rows: Vec<(&Exps, &C)> = result.fr.iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
         for (e, c) in rows {
-            out.append((c.0, c.1, PyList::new(py, e.iter().copied())?))?;
+            let (n, d) = c.big();
+            out.append((n, d, PyList::new(py, e.iter().copied())?))?;
         }
         return Ok(out.into_any().unbind());
     }
     // the rows of the two kinds
     let rank = layout.rank;
     let mut mults: FxHashMap<Vec<i32>, i128> = FxHashMap::default();
-    let mut acc_fr: FxHashMap<(i128, i64, Vec<i64>), Coef> = FxHashMap::default();
-    let mut acc_fl: FxHashMap<(i128, i64, Vec<i64>), Coef> = FxHashMap::default();
+    let mut acc_fr: FxHashMap<(i128, i64, Vec<i64>), C> = FxHashMap::default();
+    let mut acc_fl: FxHashMap<(i128, i64, Vec<i64>), C> = FxHashMap::default();
     for (fr, map) in [(true, &result.fr), (false, &result.fl)] {
         let cstart = if fr { 4 + n_fields } else { 4 + rank };
         for (e, c) in map.iter() {
@@ -609,7 +788,7 @@ pub fn expand_series<'py>(
             } else if let Some(m) = mults.get(&cexps) {
                 *m
             } else {
-                let obj = chars_of(py, &cexps, &slots, n_nodes)?;
+                let obj = chars_of(py, &cexps, slots, n_nodes)?;
                 let m: i128 = lookup.call1((obj,))?.extract()?;
                 mults.insert(cexps.clone(), m);
                 m
@@ -618,12 +797,12 @@ pub fn expand_series<'py>(
                 continue;
             }
             let xs: Vec<i64> = e[4..cstart].iter().map(|x| *x as i64).collect();
-            let cm = mul(*c, (mult, 1), false).map_err(PyValueError::new_err)?;
+            let cm = c.times_int(mult).map_err(PyValueError::new_err)?;
             let key = (milli, e[3] as i64, xs);
             let acc = if fr { &mut acc_fr } else { &mut acc_fl };
             match acc.get_mut(&key) {
                 Some(x) => {
-                    *x = add(*x, cm, false).map_err(PyValueError::new_err)?;
+                    *x = x.plus(&cm, false).map_err(PyValueError::new_err)?;
                 }
                 None => {
                     acc.insert(key, cm);
@@ -631,9 +810,18 @@ pub fn expand_series<'py>(
             }
         }
     }
-    let mut rows_fr: Vec<((i128, i64, Vec<i64>), Coef)> = acc_fr.into_iter().filter(|(_, c)| c.0 != 0).collect();
-    rows_fr.sort();
-    let mut rows_fl: Vec<((i128, i64, Vec<i64>), Coef)> = acc_fl.into_iter().filter(|(_, c)| c.0 != 0).collect();
-    rows_fl.sort();
-    crate::post::emit_rows(py, rows_fr, rows_fl, n_fields, layout.basis, native_rows)
+    // integral after the projection: back to 128 bits (a row beyond raises the overflow; the caller's FORM path follows)
+    let pairs = |acc: FxHashMap<(i128, i64, Vec<i64>), C>| -> PyResult<Vec<((i128, i64, Vec<i64>), Coef)>> {
+        let mut rows = Vec::with_capacity(acc.len());
+        for (k, c) in acc {
+            if !c.is_zero() {
+                rows.push((k, c.pair().map_err(PyValueError::new_err)?));
+            }
+        }
+        rows.sort();
+        Ok(rows)
+    };
+    let rows_fr = pairs(acc_fr)?;
+    let rows_fl = pairs(acc_fl)?;
+    crate::post::emit_rows(py, rows_fr, rows_fl, n_fields, layout.basis.clone(), native_rows)
 }

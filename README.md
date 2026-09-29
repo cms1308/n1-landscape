@@ -61,8 +61,9 @@ before its speed work, FORM and LiE included) to 8.7 s with the extension; the c
 Python path and to the FORM program alone account for about half of the first fall to 18 s.
 Every native function is checked against the pure-Python path, FORM or LiE on the same inputs
 and gives the same records; the pure-Python path stays the reference and the fallback (a
-program whose 128-bit coefficients overflow, or whose expansion exceeds the engine's monomial
-cap, runs FORM; an lcode outside the engine's forms runs LiE).
+program whose expansion exceeds the engine's monomial cap runs FORM; an lcode outside the
+engine's forms runs LiE). An expansion whose 128-bit rational coefficients overflow (expansion
+orders above about 25-34) runs again in the engine with arbitrary-precision rationals.
 
 Independently of the extension, `record.build` rejects a theory early when the C1/C2 conditions
 already fail on the exact part of an order-6 expansion (`prefilter=(3, 6)`, the default;

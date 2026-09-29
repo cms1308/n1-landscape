@@ -62,9 +62,10 @@ dependencies = [
 
 [[package]]
 name = "landscape_native"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "num-bigint",
+ "num-integer",
  "num-traits",
  "pyo3",
  "rayon",
@@ -145,6 +146,7 @@ dependencies = [
  "indoc",
  "libc",
  "memoffset",
+ "num-bigint",
  "once_cell",
  "portable-atomic",
  "pyo3-build-config",
