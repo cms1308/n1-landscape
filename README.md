@@ -28,22 +28,25 @@ Every record is a JSON document validated against `landscape/schema/record.schem
 ## Requirements
 
 - Python >= 3.10, [mpmath](https://mpmath.org/) and [SymPy](https://www.sympy.org/) (installed by `pip install .`); `pip install .[validate]` adds `jsonschema` for `record.validator()`
-- [FORM](https://www.nikhef.nl/~form/) (`form`, and `tform` for the parallel path) on `PATH`
-- [LiE](http://wwwmathlabo.univ-poitiers.fr/~maavl/LiE/) (`lie`) on `PATH`
-
-With the native extension below, FORM and LiE are needed only for its fallbacks.
+- a Rust toolchain (`rustup`) and [maturin](https://www.maturin.rs/), to build the native
+  extension (below)
+- [FORM](https://www.nikhef.nl/~form/) (`form`, and `tform` for the parallel path) and
+  [LiE](http://wwwmathlabo.univ-poitiers.fr/~maavl/LiE/) (`lie`) on `PATH`: the fallbacks of the
+  native extension, and the whole computation where the extension is not installed
 
 No Mathematica and no database server are needed. The character store is a sqlite file
-per gauge group, created automatically and filled on demand through LiE.
+per gauge group, created automatically and filled on demand (by the native character engine,
+LiE its fallback).
 
 ```bash
 pip install .
+pip install ./native
 ```
 
-## Optional native extension
+## Native extension
 
-The package runs without it, on Python with FORM and LiE (the requirements above). The `native/` directory holds an optional Rust extension,
-`landscape_native` (PyO3), that the package uses when it is importable:
+The `native/` directory holds the Rust extension `landscape_native` (PyO3), part of the
+standard installation above; the package uses it whenever it is importable:
 
 - the FORM-output parser and the combined expansion pass (parse, singlet lookups and the
   field-resolved aggregation in one call);
@@ -79,11 +82,9 @@ already fail on the exact part of an order-6 expansion (`prefilter=(3, 6)`, the 
 (`index.t_order`, `provenance.prefilter_order`) and the order-9 expansion is skipped -- in a
 campaign, where most candidates are rejected, this halves the wall of a rejection-heavy batch.
 
-Build and install it with a Rust toolchain (`rustup`) and `maturin`:
-
-```bash
-pip install ./native
-```
+Without the extension the package still runs, on Python with FORM and LiE. That path stays the
+reference of every native function, but on heavy theories it takes minutes and tens of GB where
+the extension takes seconds and a few GB.
 
 Switches (environment variables, read at import): `LANDSCAPE_NATIVE=0` selects the pure-Python
 parser and expansion, `LANDSCAPE_NATIVE_EXPAND=0` the term-level path with the native parser,
