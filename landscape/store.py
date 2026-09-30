@@ -197,9 +197,20 @@ class LabelStore:
             self._conn.executescript(_SCHEMA)
 
     def _connect(self) -> None:
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # The busy timeout is set at connect.  The switch into WAL can return "database is locked"
+        # at once while other processes open the same new file, so it is made only when the file
+        # is not in WAL yet, and retried until the deadline.
+        self._conn = sqlite3.connect(self._path, timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
+        deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+        while True:
+            try:
+                if self._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+                    break
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) or time.monotonic() > deadline:
+                    raise
+                time.sleep(0.01)
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._pid = os.getpid()
 

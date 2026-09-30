@@ -377,6 +377,14 @@ def expand_series_reference(series: Series):
     return {e: c for e, c in result.items() if c}
 
 
+class FormFailed(RuntimeError):
+    """FORM or TFORM ended with a nonzero return code (negative: the signal that ended it)."""
+
+    def __init__(self, command: str, returncode: int, output: str):
+        super().__init__(f"{command} exited with return code {returncode}: {output[-500:]}")
+        self.returncode = returncode
+
+
 class FormRunner:
     """Runs FORM programs in a work directory, with the inherited output cleaning and an
     automatic TFORM policy: an expansion runs under `tform -w<workers>` when the most recent
@@ -414,9 +422,10 @@ class FormRunner:
         return n
 
     def run(self, source: str, t_order: int, key=None) -> Optional[str]:
-        """Cleaned FORM output ('+'-separated terms), or None on a FORM timeout.  `key`: the
-        theory the program expands (IndexEngine.expansion passes one); None reads the most recent
-        output whatever its key."""
+        """Cleaned FORM output ('+'-separated terms), or None on a FORM timeout; FormFailed when
+        FORM ends with a nonzero return code (a signal, or an error of the program), its TempDir
+        cleared and the most recent output left as it was.  `key`: the theory the program expands
+        (IndexEngine.expansion passes one); None reads the most recent output whatever its key."""
         heavy = (self._workers > 0 and self._last is not None
                  and self._last[0] < t_order and self._last[1] > self._threshold
                  and (key is None or self._last[2] == key))
@@ -432,6 +441,9 @@ class FormRunner:
             return None
         finally:
             frm.unlink(missing_ok=True)
+        if res.returncode != 0:
+            self.last_cleanup = self.clear_tempdir()
+            raise FormFailed(cmd[0], res.returncode, (res.stdout + res.stderr).strip())
         out = (res.stdout.strip().replace("result", "").replace(" ", "").replace("=", "")
                .replace("\n", "").replace("z", "1").replace("\\", ""))[:-1]
         self._last = (t_order, len(out), key)

@@ -218,13 +218,16 @@ def expand_series_native(series, projector: "ProductProjector", timeout: Optiona
     (as expand_native; a FieldResolvedRows object when native_rows is set -- with `basis`, the
     rows above t^6 flavor-refined by it, the object only), or with monomials=True the
     polynomial itself [(numerator, denominator, exponents)] for the comparison with FORM's
-    output.  `exact` and `coef64` are the engine refinements of step 44.  NativeOverflow on an
-    overflow; subprocess.TimeoutExpired past the timeout."""
+    output.  `exact` and `coef64` are the engine refinements of step 44.  The singlet
+    multiplicities are computed in the extension from the stores' groups, `projector.multiplicity`
+    its fallback (and, with LANDSCAPE_NATIVE_VERIFY_MULT=1, the check of every value).
+    NativeOverflow on an overflow; subprocess.TimeoutExpired past the timeout."""
     try:
         return _native.expand_series(series.terms, series.t_limit, series.max_order, series.n_fields,
                                      [(node, list(label), k) for node, label, k in series.slots], series.n_nodes,
                                      series.t_order, lambda chars: projector.multiplicity(chars, budget_s), timeout, monomials,
-                                     native_rows, basis, exact, coef64)
+                                     native_rows, basis, exact, coef64,
+                                     [(s.lie_group, s.type, s.rank) for s in projector._stores])
     except ValueError as e:
         if str(e).startswith("capacity"):
             raise NativeCapacity(str(e)) from e

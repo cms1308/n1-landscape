@@ -50,7 +50,10 @@ The package runs on Python alone. The `native/` directory holds an optional Rust
 - the expansion engine in place of the FORM run: the exponential of the single-letter series,
   truncated as FORM truncates it, the monomials above t^6 carried in the flavor exponents of the
   record's basis instead of the field markers (the post-processing reads field-resolved terms
-  through t^6 only);
+  through t^6 only); the rows are accumulated from each power as it is formed, the monomials are
+  packed into fixed-width words, and the singlet multiplicity of each character product is
+  computed in the extension (Brauer-Klimyk tensor products on the native character engine's
+  weights), the Python projector being the fallback;
 - the post-processing pass over the engine's rows: the reduced index, its flavor projection,
   the net index and the physical index in one native pass, the F-term substitution, the
   operator lists and the record staying in Python.
@@ -61,9 +64,12 @@ before its speed work, FORM and LiE included) to 8.7 s with the extension; the c
 Python path and to the FORM program alone account for about half of the first fall to 18 s.
 Every native function is checked against the pure-Python path, FORM or LiE on the same inputs
 and gives the same records; the pure-Python path stays the reference and the fallback (a
-program whose expansion exceeds the engine's monomial cap runs FORM; an lcode outside the
-engine's forms runs LiE). An expansion whose 128-bit rational coefficients overflow (expansion
-orders above about 25-34) runs again in the engine with arbitrary-precision rationals.
+program one of whose powers exceeds the engine's monomial cap runs FORM; an lcode outside the
+engine's forms runs LiE). A coefficient that overflows 128 bits (expansion orders above about
+25-34) is promoted in place to an arbitrary-precision rational. A FORM or TFORM run that ends
+with a nonzero return code (killed, for instance under a memory limit) raises
+`form.FormFailed`, and the driver writes the input to the level's errors file instead of a
+record.
 
 Independently of the extension, `record.build` rejects a theory early when the C1/C2 conditions
 already fail on the exact part of an order-6 expansion (`prefilter=(3, 6)`, the default;
@@ -82,8 +88,9 @@ parser and expansion, `LANDSCAPE_NATIVE_EXPAND=0` the term-level path with the n
 `LANDSCAPE_NATIVE_FORM=0` the FORM run, `LANDSCAPE_NATIVE_LIE=0` the LiE subprocess,
 `LANDSCAPE_NATIVE_POST=0` the Python post-processing, `LANDSCAPE_NATIVE_FLAVOR=0` the
 field-resolved expansion through the full order, `LANDSCAPE_NATIVE_THREADS=n` the engines'
-thread count, `LANDSCAPE_NATIVE_MAX_TERMS=n` the engine's monomial cap (default 8,000,000; a
-larger expansion runs FORM). Two further switches, `LANDSCAPE_NATIVE_COEF64=1` and
+thread count, `LANDSCAPE_NATIVE_MAX_TERMS=n` the engine's monomial cap (default 8,000,000 in one
+power; a larger power runs FORM), `LANDSCAPE_NATIVE_VERIFY_MULT=1` checks every singlet
+multiplicity the extension computes against the Python projector. Two further switches, `LANDSCAPE_NATIVE_COEF64=1` and
 `LANDSCAPE_NATIVE_EXACT=1`, turn on variants of the engine's arithmetic and truncation that were
 measured and not adopted; they give the same records. Without the extension every switch is
 inert.

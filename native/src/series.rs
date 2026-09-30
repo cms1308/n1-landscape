@@ -1,21 +1,33 @@
-//! The native expansion engine (step 39f; refined in step 44): the exponential of the explicit
-//! itotal of `landscape.form.program`, truncated at the t-power limit and at `max_order` powers,
-//! in place of the FORM run -- the same polynomial FORM prints as `result`.
+//! The native expansion engine (step 39f; refined in steps 44, 54 and 56b): the exponential of the
+//! explicit itotal of `landscape.form.program`, truncated at the t-power limit and at `max_order`
+//! powers, in place of the FORM run -- the same polynomial FORM prints as `result`, and from it the
+//! rows of the field-resolved expansion.
 //!
-//! A monomial is an exponent vector [t, s, r, y, f_1..f_n, c_1..c_m] (`form.Series`); the
-//! product of two monomials adds the vectors; a coefficient is a reduced 128-bit rational, and
-//! when one overflows the same expansion runs again with arbitrary-precision rationals (step 54;
-//! the factors 1/k give denominators of the order of k!, beyond 128 bits above an expansion order
-//! of about 25-34).  With P_1 = itotal and
-//! P_k = P_{k-1} itotal / k, the result is 1 + sum_k P_k for k = 1..max_order, every product
-//! whose t-power exceeds the limit dropped before it is formed (the terms of itotal sorted by
-//! t-power, the multiplication of a term of P_{k-1} stopping at the bound) -- the products FORM's
-//! bounded loop generates and keeps, and none of the ones it discards.  The products of the
-//! terms of P_{k-1} run in parallel (rayon), the partial maps merged; a deadline is checked
-//! inside the loops and raises subprocess.TimeoutExpired; a power beyond the monomial cap raises
-//! "capacity" and the caller falls back to FORM.
+//! A monomial is an exponent vector [t, s, r, y, f_1..f_n, c_1..c_m] (`form.Series`); the product of
+//! two monomials adds the vectors.  With P_1 = itotal and P_k = P_{k-1} itotal / k, the result is
+//! 1 + sum_k P_k for k = 1..max_order, every product whose t-power exceeds the limit dropped before
+//! it is formed (the terms of itotal sorted by t-power, the multiplication of a term of P_{k-1}
+//! stopping at the bound) -- the products FORM's bounded loop generates and keeps, and none of the
+//! ones it discards.  The products of the terms of P_{k-1} run in parallel (rayon), the partial maps
+//! merged; a deadline is checked inside the loops and raises subprocess.TimeoutExpired; a power
+//! beyond the monomial cap raises "capacity" and the caller falls back to FORM.
 //!
-//! The refinements of step 44, each a parameter, off by default:
+//! Step 56b (extension 0.8.0), the memory of the engine:
+//!   * the rows are accumulated from every power as it is formed; no map of the whole exponential
+//!     is kept (the monomial mode, the comparison with FORM, keeps it), so the cap applies to one
+//!     power;
+//!   * a monomial is a fixed-width array of machine words: each exponent a bit field with an offset,
+//!     its width from a bound valid for every monomial within the t-limit (a field is at most the
+//!     t-limit times the largest ratio of that exponent to the t-power over the letters, and at most
+//!     max_order times the largest letter), so that the product of two monomials is one addition and
+//!     one subtraction per word with no carry between the fields;
+//!   * a coefficient is a reduced rational of two `i128`, promoted in place to arbitrary precision
+//!     when an operation overflows (step 54 ran the whole expansion a second time instead);
+//!   * the singlet multiplicity of a character product is computed in the extension (`project.rs`),
+//!     the Python projector (`lookup`) its fallback and, with LANDSCAPE_NATIVE_VERIFY_MULT=1, the
+//!     check of every value.
+//!
+//! The refinements of step 44, each a parameter, off by default unless the caller sets it:
 //!   * `basis` (the flavor projection above t^6): a monomial whose milli exponent -- from its
 //!     t, s, r sum, the rule of the rows -- exceeds `project_above` (6000) holds the flavor
 //!     exponents basis . markers in place of the markers, [t, s, r, y, x_1..x_rank, c_1..c_m].
@@ -24,22 +36,20 @@
 //!     every power are kept in two lists, field-resolved and flavor-refined, and the rows come in
 //!     the two kinds (`post::emit_rows`).  Weights are positive, so a field-resolved product arises
 //!     from field-resolved factors only: the field-resolved part is complete through t^6.
-//!   * `coef64`: the coefficient arithmetic without a 128-bit division where both operands fit
-//!     in 62 bits (a binary gcd on 64-bit integers) and without any where a denominator is one;
-//!     the same reduced rationals by another route.
+//!   * `coef64`: the 128-bit arithmetic without a 128-bit division where both operands fit in 62
+//!     bits (a binary gcd on 64-bit integers) and without any where a denominator is one.
 //!   * `exact`: a product whose milli exceeds `milli_limit` (1000 t_order) is not formed; the
-//!     integer t-power bound stays the outer filter (a monomial above the limit contributes to no
-//!     row at or below it, weights being positive).
+//!     integer t-power bound stays the outer filter.
 //!
-//! `expand_series(..., monomials=true)` returns the polynomial itself, (numerator,
-//! denominator, exponents) per monomial, for the comparison with FORM's parsed output (without a
-//! basis and without `exact`, the polynomial FORM prints); `monomials=false` returns the rows of
-//! the field-resolved expansion as `expand` does (as a `FieldResolvedRows` object when
-//! `native_rows` is set; with a basis, the object only): the terms above t_order dropped by their
-//! milli exponent, the singlet multiplicity of every distinct character product obtained through
-//! the projector's `multiplicity`, coefficient x multiplicity summed per (milli, y power, markers)
-//! or per (milli, y power, flavor).
+//! `expand_series(..., monomials=true)` returns the polynomial itself, (numerator, denominator,
+//! exponents) per monomial, for the comparison with FORM's parsed output (without a basis and
+//! without `exact`, the polynomial FORM prints); `monomials=false` returns the rows of the
+//! field-resolved expansion (as a `FieldResolvedRows` object when `native_rows` is set; with a
+//! basis, the object only): the terms above t_order dropped by their milli exponent,
+//! coefficient x singlet multiplicity summed per (milli, y power, markers) or per (milli, y power,
+//! flavor).
 
+use crate::project::Projector;
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -52,12 +62,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-type Exps = Vec<i32>;
 type Coef = (i128, i128);
-type Term<C> = (Exps, C);
-type Map<C> = FxHashMap<Exps, C>;
 
-/// The overflow of a 128-bit coefficient: the expansion runs again with `Big`.
+/// A row value beyond 128 bits after the projection: the caller's FORM path follows.
 const COEF_OVERFLOW: &str = "coefficient overflow";
 
 // --------------------------------------------------------------------------- //
@@ -134,87 +141,28 @@ fn reduce(n: i128, d: i128, fast: bool) -> Result<Coef, String> {
 }
 
 #[inline]
-fn mul(a: Coef, b: Coef, fast: bool) -> Result<Coef, String> {
-    let n = a.0.checked_mul(b.0).ok_or("overflow")?;
-    let d = a.1.checked_mul(b.1).ok_or("overflow")?;
+fn mul(a: Coef, b: Coef, fast: bool) -> Option<Coef> {
+    let n = a.0.checked_mul(b.0)?;
+    let d = a.1.checked_mul(b.1)?;
     if fast && d == 1 {
-        return Ok((n, 1));
+        return Some((n, 1));
     }
-    reduce(n, d, fast)
+    reduce(n, d, fast).ok()
 }
 
 #[inline]
-fn add(a: Coef, b: Coef, fast: bool) -> Result<Coef, String> {
+fn add(a: Coef, b: Coef, fast: bool) -> Option<Coef> {
     if a.1 == b.1 {
-        return reduce(a.0.checked_add(b.0).ok_or("overflow")?, a.1, fast);
+        return reduce(a.0.checked_add(b.0)?, a.1, fast).ok();
     }
-    let n = a.0.checked_mul(b.1).ok_or("overflow")?.checked_add(b.0.checked_mul(a.1).ok_or("overflow")?).ok_or("overflow")?;
-    let d = a.1.checked_mul(b.1).ok_or("overflow")?;
-    reduce(n, d, fast)
-}
-
-/// The coefficient arithmetic of the engine: a reduced rational of two `i128` (`Coef`, checked, an
-/// overflow raising COEF_OVERFLOW) or of two `BigInt` (`Big`).  `fast` is the `coef64` route of the
-/// 128-bit arithmetic (step 44); `Big` ignores it.
-pub(crate) trait Coeff: Clone + Send + Sync {
-    fn from_pair(n: i128, d: i128) -> Result<Self, String>;
-    fn one() -> Self;
-    fn is_zero(&self) -> bool;
-    fn times(&self, b: &Self, fast: bool) -> Result<Self, String>;
-    fn plus(&self, b: &Self, fast: bool) -> Result<Self, String>;
-    fn over(&self, k: i128, fast: bool) -> Result<Self, String>;
-    fn times_int(&self, m: i128) -> Result<Self, String>;
-    /// The value as two `i128`, or COEF_OVERFLOW.
-    fn pair(&self) -> Result<Coef, String>;
-    fn big(&self) -> (BigInt, BigInt);
-}
-
-fn coef_overflow<E>(_: E) -> String {
-    COEF_OVERFLOW.to_string()
-}
-
-impl Coeff for Coef {
-    #[inline]
-    fn from_pair(n: i128, d: i128) -> Result<Self, String> {
-        reduce(n, d, false)
-    }
-    #[inline]
-    fn one() -> Self {
-        (1, 1)
-    }
-    #[inline]
-    fn is_zero(&self) -> bool {
-        self.0 == 0
-    }
-    #[inline]
-    fn times(&self, b: &Self, fast: bool) -> Result<Self, String> {
-        mul(*self, *b, fast).map_err(coef_overflow)
-    }
-    #[inline]
-    fn plus(&self, b: &Self, fast: bool) -> Result<Self, String> {
-        add(*self, *b, fast).map_err(coef_overflow)
-    }
-    #[inline]
-    fn over(&self, k: i128, fast: bool) -> Result<Self, String> {
-        let d = self.1.checked_mul(k).ok_or(COEF_OVERFLOW)?;
-        reduce(self.0, d, fast)
-    }
-    #[inline]
-    fn times_int(&self, m: i128) -> Result<Self, String> {
-        mul(*self, (m, 1), false).map_err(coef_overflow)
-    }
-    #[inline]
-    fn pair(&self) -> Result<Coef, String> {
-        Ok(*self)
-    }
-    fn big(&self) -> (BigInt, BigInt) {
-        (BigInt::from(self.0), BigInt::from(self.1))
-    }
+    let n = a.0.checked_mul(b.1)?.checked_add(b.0.checked_mul(a.1)?)?;
+    let d = a.1.checked_mul(b.1)?;
+    reduce(n, d, fast).ok()
 }
 
 /// An arbitrary-precision reduced rational (denominator positive).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Big {
+struct Big {
     n: BigInt,
     d: BigInt,
 }
@@ -240,39 +188,85 @@ impl Big {
     }
 }
 
-impl Coeff for Big {
-    fn from_pair(n: i128, d: i128) -> Result<Self, String> {
-        Big::reduced(BigInt::from(n), BigInt::from(d))
+/// The engine's coefficient: a reduced rational of two `i128`, or, once an operation on it has
+/// overflowed, of two `BigInt` (brought back to `i128` whenever the reduced value fits).
+#[derive(Clone, Debug)]
+enum Q {
+    S(i128, i128),
+    B(Box<Big>),
+}
+
+impl Q {
+    fn from_pair(n: i128, d: i128) -> Result<Q, String> {
+        reduce(n, d, false).map(|(n, d)| Q::S(n, d))
     }
-    fn one() -> Self {
-        Big { n: BigInt::one(), d: BigInt::one() }
+    fn one() -> Q {
+        Q::S(1, 1)
     }
+    #[inline]
     fn is_zero(&self) -> bool {
-        self.n.is_zero()
-    }
-    fn times(&self, b: &Self, _fast: bool) -> Result<Self, String> {
-        Big::reduced(&self.n * &b.n, &self.d * &b.d)
-    }
-    fn plus(&self, b: &Self, _fast: bool) -> Result<Self, String> {
-        if self.d == b.d {
-            return Big::reduced(&self.n + &b.n, self.d.clone());
+        match self {
+            Q::S(n, _) => *n == 0,
+            Q::B(b) => b.n.is_zero(),
         }
-        Big::reduced(&self.n * &b.d + &b.n * &self.d, &self.d * &b.d)
     }
-    fn over(&self, k: i128, _fast: bool) -> Result<Self, String> {
-        Big::reduced(self.n.clone(), &self.d * BigInt::from(k))
+    fn big(&self) -> Big {
+        match self {
+            Q::S(n, d) => Big { n: BigInt::from(*n), d: BigInt::from(*d) },
+            Q::B(b) => (**b).clone(),
+        }
     }
-    fn times_int(&self, m: i128) -> Result<Self, String> {
-        Big::reduced(&self.n * BigInt::from(m), self.d.clone())
+    fn of_big(b: Big) -> Q {
+        match (b.n.to_i128(), b.d.to_i128()) {
+            (Some(n), Some(d)) => Q::S(n, d),
+            _ => Q::B(Box::new(b)),
+        }
     }
+    #[inline]
+    fn times(&self, o: &Q, fast: bool) -> Result<Q, String> {
+        if let (Q::S(a, b), Q::S(c, d)) = (self, o) {
+            if let Some((n, d)) = mul((*a, *b), (*c, *d), fast) {
+                return Ok(Q::S(n, d));
+            }
+        }
+        let (x, y) = (self.big(), o.big());
+        Ok(Q::of_big(Big::reduced(&x.n * &y.n, &x.d * &y.d)?))
+    }
+    #[inline]
+    fn plus(&self, o: &Q, fast: bool) -> Result<Q, String> {
+        if let (Q::S(a, b), Q::S(c, d)) = (self, o) {
+            if let Some((n, d)) = add((*a, *b), (*c, *d), fast) {
+                return Ok(Q::S(n, d));
+            }
+        }
+        let (x, y) = (self.big(), o.big());
+        if x.d == y.d {
+            return Ok(Q::of_big(Big::reduced(&x.n + &y.n, x.d)?));
+        }
+        Ok(Q::of_big(Big::reduced(&x.n * &y.d + &y.n * &x.d, &x.d * &y.d)?))
+    }
+    fn over(&self, k: i128, fast: bool) -> Result<Q, String> {
+        if let Q::S(n, d) = self {
+            if let Some(dk) = d.checked_mul(k) {
+                return reduce(*n, dk, fast).map(|(n, d)| Q::S(n, d));
+            }
+        }
+        let x = self.big();
+        Ok(Q::of_big(Big::reduced(x.n, &x.d * BigInt::from(k))?))
+    }
+    fn times_int(&self, m: i128) -> Result<Q, String> {
+        self.times(&Q::S(m, 1), false)
+    }
+    /// The value as two `i128`, or COEF_OVERFLOW.
     fn pair(&self) -> Result<Coef, String> {
-        match (self.n.to_i128(), self.d.to_i128()) {
-            (Some(n), Some(d)) => Ok((n, d)),
-            _ => Err(COEF_OVERFLOW.to_string()),
+        match self {
+            Q::S(n, d) => Ok((*n, *d)),
+            Q::B(_) => Err(COEF_OVERFLOW.to_string()),
         }
     }
-    fn big(&self) -> (BigInt, BigInt) {
-        (self.n.clone(), self.d.clone())
+    fn big_pair(&self) -> (BigInt, BigInt) {
+        let b = self.big();
+        (b.n, b.d)
     }
 }
 
@@ -285,25 +279,12 @@ fn check_deadline(deadline: Option<Instant>) -> Result<(), String> {
     Ok(())
 }
 
-fn merge_into<C: Coeff>(into: &mut Map<C>, from: Map<C>, fast: bool) -> Result<(), String> {
-    for (k, c) in from {
-        match into.get_mut(&k) {
-            Some(e) => {
-                *e = e.plus(&c, fast)?;
-            }
-            None => {
-                into.insert(k, c);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The monomial cap of the engine (LANDSCAPE_NATIVE_MAX_TERMS, default 8,000,000): a power of the
-/// series, or the truncated exponential, with more monomials than this raises "__capacity__" and
-/// the caller falls back to FORM, which sorts on disk.  Found on the June-2026 Sp2nf5 landscape
-/// (a theory of 25 fields and expansion order 38: 10 M monomials at k = 5 and 20 GB at k = 6;
-/// FORM had computed it), whose orders lie above the 18 of the engine's evidence sets.
+/// series with more monomials than this raises "__capacity__" and the caller falls back to FORM,
+/// which sorts on disk.  Found on the June-2026 Sp2nf5 landscape (a theory of 25 fields and
+/// expansion order 38: 10 M monomials at k = 5 and 20 GB at k = 6 before the flavor projection;
+/// FORM had computed it).  Since step 56b the cap applies to one power, the whole exponential no
+/// longer being held.
 fn capacity() -> usize {
     std::env::var("LANDSCAPE_NATIVE_MAX_TERMS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(8_000_000)
 }
@@ -323,8 +304,8 @@ fn milli_exponent(tpow: i64, spow: i64, rpow: i64) -> i128 {
 /// additive under products, so a product's milli is classified by one comparison of the sum with a
 /// threshold (no division per product).
 #[inline]
-fn weight_n(e: &[i32]) -> i64 {
-    25_000_000 * e[0] as i64 + 5_000 * e[1] as i64 + e[2] as i64
+fn weight_n(t: i64, s: i64, r: i64) -> i64 {
+    25_000_000 * t + 5_000 * s + r
 }
 
 /// The smallest scaled weight whose milli exceeds `milli`.
@@ -334,68 +315,197 @@ fn threshold_n(milli: i64) -> i64 {
 }
 
 // --------------------------------------------------------------------------- //
+// packed monomials
+// --------------------------------------------------------------------------- //
+/// The bounds [lo, hi] of every exponent over the monomials within the t-limit, from the letters.
+fn field_bounds(letters: &[Vec<i64>], t_limit: i64, max_order: i64) -> (Vec<i64>, Vec<i64>) {
+    let w = letters.first().map(|e| e.len()).unwrap_or(0);
+    let mut lo = vec![0i64; w];
+    let mut hi = vec![0i64; w];
+    if w == 0 {
+        return (lo, hi);
+    }
+    hi[0] = t_limit.max(0);
+    for j in 1..w {
+        let (mut maxpos, mut minneg) = (0i64, 0i64);
+        let (mut rpos, mut rneg) = (0i64, 0i64);
+        let mut zero_t = false;
+        for e in letters {
+            let x = e[j];
+            maxpos = maxpos.max(x);
+            minneg = minneg.min(x);
+            if e[0] > 0 {
+                let prod = t_limit as i128 * x as i128;
+                let d = e[0] as i128;
+                if x > 0 {
+                    rpos = rpos.max(((prod + d - 1) / d) as i64);
+                } else if x < 0 {
+                    rneg = rneg.min(-(((-prod) + d - 1) / d) as i64);
+                }
+            } else if x != 0 {
+                zero_t = true;
+            }
+        }
+        hi[j] = max_order.saturating_mul(maxpos);
+        lo[j] = max_order.saturating_mul(minneg);
+        if !zero_t {
+            hi[j] = hi[j].min(rpos);
+            lo[j] = lo[j].max(rneg);
+        }
+    }
+    (lo, hi)
+}
+
+/// The fields of a layout: (word, shift, width in bits) for the bounds, stored value = v + offset,
+/// the width holding every intermediate sum of two stored values of a valid product.
+fn field_layout(lo: &[i64], hi: &[i64]) -> Result<(Vec<(usize, u32, u32, i64)>, usize), String> {
+    let mut out = Vec::with_capacity(lo.len());
+    let (mut w, mut used) = (0usize, 0u32);
+    for (l, h) in lo.iter().zip(hi.iter()) {
+        let off = (-*l).max(0);
+        let top = (*h as i128) + 2 * (off as i128);
+        if top < 0 || top >= (1i128 << 62) {
+            return Err("__capacity__".into());
+        }
+        let bits = (128 - (top as u128).leading_zeros()).max(1);
+        if used + bits > 64 {
+            w += 1;
+            used = 0;
+        }
+        out.push((w, used, bits, off));
+        used += bits;
+    }
+    Ok((out, if lo.is_empty() { 0 } else { w + 1 }))
+}
+
+struct Packer<const N: usize> {
+    fields: Vec<(usize, u32, u64, i64)>, // (word, shift, mask, offset)
+    bias: [u64; N],
+}
+
+impl<const N: usize> Packer<N> {
+    fn new(lo: &[i64], hi: &[i64]) -> Result<Self, String> {
+        let (layout, words) = field_layout(lo, hi)?;
+        if words > N {
+            return Err("__capacity__".into());
+        }
+        let mut bias = [0u64; N];
+        let mut fields = Vec::with_capacity(layout.len());
+        for (w, s, bits, off) in layout {
+            let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            bias[w] |= (off as u64) << s;
+            fields.push((w, s, mask, off));
+        }
+        Ok(Packer { fields, bias })
+    }
+    #[inline]
+    fn pack(&self, v: &[i64]) -> [u64; N] {
+        let mut k = [0u64; N];
+        for ((w, s, _, off), x) in self.fields.iter().zip(v.iter()) {
+            k[*w] |= ((x + off) as u64) << s;
+        }
+        k
+    }
+    #[inline]
+    fn get(&self, k: &[u64; N], j: usize) -> i64 {
+        let (w, s, m, off) = self.fields[j];
+        ((k[w] >> s) & m) as i64 - off
+    }
+    /// The words with only the fields `from..` kept (the character slots of a layout).
+    fn mask_from(&self, from: usize) -> [u64; N] {
+        let mut m = [0u64; N];
+        for (w, s, mask, _) in self.fields[from..].iter() {
+            m[*w] |= mask << s;
+        }
+        m
+    }
+    fn unpack(&self, k: &[u64; N]) -> Vec<i64> {
+        (0..self.fields.len()).map(|j| self.get(k, j)).collect()
+    }
+    #[inline]
+    fn add(&self, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
+        let mut o = [0u64; N];
+        for i in 0..N {
+            o[i] = a[i].wrapping_add(b[i]).wrapping_sub(self.bias[i]);
+        }
+        o
+    }
+}
+
+type Map<const N: usize> = FxHashMap<[u64; N], Q>;
+
+// --------------------------------------------------------------------------- //
 // the layout of the monomials
 // --------------------------------------------------------------------------- //
-/// The exponent layouts: field-resolved [t, s, r, y, f_1..f_n, c_1..c_m] and, with a basis,
-/// flavor-refined [t, s, r, y, x_1..x_rank, c_1..c_m]; the parameters of the refinements.
-struct Layout {
+struct Ctx<const N: usize> {
+    pf: Packer<N>,       // field-resolved [t, s, r, y, f_1..f_n, c_1..c_m]
+    pl: Packer<N>,       // flavor-refined [t, s, r, y, x_1..x_rank, c_1..c_m] (a basis only)
     n_fields: usize,
     n_slots: usize,
     basis: Option<Vec<Vec<i64>>>,
     rank: usize,
-    project_above: i64,
-    above_n: i64,       // threshold_n(project_above)
-    limit_n: i64,       // threshold_n(milli_limit)
+    above_n: i64,
+    limit_n: i64,
     exact: bool,
     fast: bool,
 }
 
-impl Layout {
+impl<const N: usize> Ctx<N> {
     #[inline]
     fn classify(&self) -> bool {
         self.basis.is_some() || self.exact
     }
 
-    /// basis . markers of a field-resolved monomial.
-    fn flavor(&self, e: &[i32]) -> Result<Vec<i32>, String> {
+    /// basis . markers of an unpacked field-resolved vector, as the flavor-refined vector.
+    fn to_flavor(&self, e: &[i64]) -> Result<Vec<i64>, String> {
         let basis = self.basis.as_ref().expect("a basis");
-        let mut out = Vec::with_capacity(self.rank);
+        let mut out = Vec::with_capacity(4 + self.rank + self.n_slots);
+        out.extend_from_slice(&e[..4]);
         for row in basis {
             let mut s: i64 = 0;
             for (b, x) in row.iter().zip(e[4..4 + self.n_fields].iter()) {
-                s = s.checked_add(b.checked_mul(*x as i64).ok_or("overflow")?).ok_or("overflow")?;
+                s = s.checked_add(b.checked_mul(*x).ok_or("overflow")?).ok_or("overflow")?;
             }
-            out.push(i32::try_from(s).map_err(|_| "flavor exponent out of range".to_string())?);
+            out.push(s);
         }
-        Ok(out)
-    }
-
-    /// A field-resolved term as a flavor-refined one.
-    fn to_flavor(&self, e: &[i32]) -> Result<Exps, String> {
-        let mut out = Vec::with_capacity(4 + self.rank + self.n_slots);
-        out.extend_from_slice(&e[..4]);
-        out.extend(self.flavor(e)?);
         out.extend_from_slice(&e[4 + self.n_fields..]);
         Ok(out)
     }
+
+    fn image(&self, k: &[u64; N]) -> Result<[u64; N], String> {
+        Ok(self.pl.pack(&self.to_flavor(&self.pf.unpack(k))?))
+    }
 }
 
-/// The two lists of a power (or of itotal): field-resolved terms and flavor-refined terms, the
-/// former with their flavor images (computed once per term) when a basis is set.
-struct Power<C> {
-    fr: Vec<Term<C>>,
-    fr_flavor: Vec<Exps>,
-    fr_n: Vec<i64>,      // the scaled weights of the field-resolved terms (the letters; a power's are computed per row)
-    fl: Vec<Term<C>>,
+/// itotal's letters sorted by t-power: the field-resolved ones with their flavor images, the
+/// flavor-refined ones (a basis only).
+struct Letters<const N: usize> {
+    fr: Vec<([u64; N], Q)>,
+    fr_t: Vec<i64>,
+    fr_n: Vec<i64>,
+    fr_img: Vec<[u64; N]>,
+    fl: Vec<([u64; N], Q)>,
+    fl_t: Vec<i64>,
     fl_n: Vec<i64>,
 }
 
-struct Maps<C> {
-    fr: Map<C>,
-    fl: Map<C>,
+struct Power<const N: usize> {
+    fr: Vec<([u64; N], Q)>,
+    fl: Vec<([u64; N], Q)>,
 }
 
-impl<C> Maps<C> {
+impl<const N: usize> Power<N> {
+    fn len(&self) -> usize {
+        self.fr.len() + self.fl.len()
+    }
+}
+
+struct Maps<const N: usize> {
+    fr: Map<N>,
+    fl: Map<N>,
+}
+
+impl<const N: usize> Maps<N> {
     fn new() -> Self {
         Maps { fr: FxHashMap::default(), fl: FxHashMap::default() }
     }
@@ -405,36 +515,39 @@ impl<C> Maps<C> {
 }
 
 #[inline]
-fn insert<C: Coeff>(map: &mut Map<C>, key: &Exps, c: C, fast: bool) -> Result<(), String> {
-    match map.get_mut(key) {
+fn insert<const N: usize>(map: &mut Map<N>, key: [u64; N], c: Q, fast: bool) -> Result<(), String> {
+    match map.get_mut(&key) {
         Some(e) => {
             *e = e.plus(&c, fast)?;
         }
         None => {
-            map.insert(key.clone(), c);
+            map.insert(key, c);
         }
     }
     Ok(())
 }
 
+fn merge_into<const N: usize>(into: &mut Map<N>, from: Map<N>, fast: bool) -> Result<(), String> {
+    for (k, c) in from {
+        insert(into, k, c, fast)?;
+    }
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// the powers
+// --------------------------------------------------------------------------- //
 /// The products of one chunk of terms of P_{k-1} (of one kind) with itotal.  `live` counts the
 /// monomials held by every chunk of the step so far; past twice the cap the step stops with
-/// "__capacity__" before the merge (the guard of Q-6.6, on the sum instead of a per-chunk share:
-/// the field-resolved and flavor-refined lists of the projection make the chunks unequal).
+/// "__capacity__" before the merge.
 #[allow(clippy::too_many_arguments)]
-fn products<C: Coeff>(rows: &[Term<C>], rows_flavor: &[Exps], rows_fr: bool, itotal: &Power<C>, layout: &Layout, t_limit: i32,
-                      deadline: Option<Instant>, cap: usize, live: &AtomicUsize) -> Result<Maps<C>, String> {
+fn products<const N: usize>(rows: &[([u64; N], Q)], rows_fr: bool, it: &Letters<N>, ctx: &Ctx<N>, t_limit: i64,
+                            deadline: Option<Instant>, cap: usize, live: &AtomicUsize) -> Result<Maps<N>, String> {
     check_deadline(deadline)?;
     let mut reported = 0usize;
-    let n = layout.n_fields;
-    let r = layout.rank;
-    let m = layout.n_slots;
-    let fast = layout.fast;
+    let fast = ctx.fast;
+    let p = if rows_fr { &ctx.pf } else { &ctx.pl };
     let mut local = Maps::new();
-    let width_fr = 4 + n + m;
-    let width_fl = 4 + r + m;
-    let mut key_fr: Exps = vec![0; width_fr];
-    let mut key_fl: Exps = vec![0; width_fl];
     for (row, (ep, cp)) in rows.iter().enumerate() {
         if row % 256 == 255 {
             check_deadline(deadline)?;
@@ -447,56 +560,41 @@ fn products<C: Coeff>(rows: &[Term<C>], rows_flavor: &[Exps], rows_fr: bool, ito
                 return Err("__capacity__".into());
             }
         }
-        let bound = t_limit - ep[0];
-        let n_ep = weight_n(ep);
-        let ep_flavor: &[i32] = if rows_fr { if layout.basis.is_some() { &rows_flavor[row] } else { &[] } } else { &ep[4..4 + r] };
-        let ep_chars: &[i32] = if rows_fr { &ep[4 + n..] } else { &ep[4 + r..] };
+        let t_ep = p.get(ep, 0);
+        let bound = t_limit - t_ep;
+        let n_ep = if ctx.classify() { weight_n(t_ep, p.get(ep, 1), p.get(ep, 2)) } else { 0 };
+        let ep_img: Option<[u64; N]> = if rows_fr && ctx.basis.is_some() { Some(ctx.image(ep)?) } else { None };
         // x field-resolved letters
-        for (j, (ei, ci)) in itotal.fr.iter().enumerate() {
-            if ei[0] > bound {
+        for j in 0..it.fr.len() {
+            if it.fr_t[j] > bound {
                 break;
             }
             let mut n_p = 0i64;
-            if layout.classify() {
-                n_p = n_ep + itotal.fr_n[j];
-                if layout.exact && n_p >= layout.limit_n {
+            if ctx.classify() {
+                n_p = n_ep + it.fr_n[j];
+                if ctx.exact && n_p >= ctx.limit_n {
                     continue;
                 }
             }
-            let c = cp.times(ci, fast)?;
-            if rows_fr && (layout.basis.is_none() || n_p < layout.above_n) {
-                for j in 0..width_fr {
-                    key_fr[j] = ep[j] + ei[j];
-                }
-                insert(&mut local.fr, &key_fr, c, fast)?;
+            let c = cp.times(&it.fr[j].1, fast)?;
+            if rows_fr && (ctx.basis.is_none() || n_p < ctx.above_n) {
+                insert(&mut local.fr, ctx.pf.add(ep, &it.fr[j].0), c, fast)?;
             } else {
-                for j in 0..4 {
-                    key_fl[j] = ep[j] + ei[j];
-                }
-                let ei_flavor = &itotal.fr_flavor[j];
-                for j in 0..r {
-                    key_fl[4 + j] = ep_flavor[j] + ei_flavor[j];
-                }
-                let ei_chars = &ei[4 + n..];
-                for j in 0..m {
-                    key_fl[4 + r + j] = ep_chars[j] + ei_chars[j];
-                }
-                insert(&mut local.fl, &key_fl, c, fast)?;
+                let a = if rows_fr { ep_img.as_ref().expect("an image") } else { ep };
+                insert(&mut local.fl, ctx.pl.add(a, &it.fr_img[j]), c, fast)?;
             }
         }
         // x flavor-refined letters (a basis only)
-        for (j, (ei, ci)) in itotal.fl.iter().enumerate() {
-            if ei[0] > bound {
+        for j in 0..it.fl.len() {
+            if it.fl_t[j] > bound {
                 break;
             }
-            if layout.exact && n_ep + itotal.fl_n[j] >= layout.limit_n {
+            if ctx.exact && n_ep + it.fl_n[j] >= ctx.limit_n {
                 continue;
             }
-            let c = cp.times(ci, fast)?;
-            for j in 0..width_fl {
-                key_fl[j] = if j < 4 { ep[j] + ei[j] } else if j < 4 + r { ep_flavor[j - 4] + ei[j] } else { ep_chars[j - 4 - r] + ei[j] };
-            }
-            insert(&mut local.fl, &key_fl, c, fast)?;
+            let c = cp.times(&it.fl[j].1, fast)?;
+            let a = if rows_fr { ep_img.as_ref().expect("an image") } else { ep };
+            insert(&mut local.fl, ctx.pl.add(a, &it.fl[j].0), c, fast)?;
         }
     }
     Ok(local)
@@ -505,137 +603,53 @@ fn products<C: Coeff>(rows: &[Term<C>], rows_flavor: &[Exps], rows_fr: bool, ito
 /// P_{k-1} x itotal with the t-bound, divided by k.  The deadline is checked every 256 rows of
 /// every chunk and at every merge; the chunks together past twice the cap during the step, or
 /// past the cap after it, stop with "__capacity__" before the merge.
-fn step<C: Coeff>(prev: &Power<C>, itotal: &Power<C>, layout: &Layout, t_limit: i32, k: i128, deadline: Option<Instant>,
-                  cap: usize) -> Result<Maps<C>, String> {
-    let total = prev.fr.len() + prev.fl.len();
+fn step<const N: usize>(prev: &Power<N>, it: &Letters<N>, ctx: &Ctx<N>, t_limit: i64, k: i128, deadline: Option<Instant>,
+                        cap: usize) -> Result<Power<N>, String> {
+    let total = prev.len();
     let chunk = ((total + 63) / 64).max(64);
-    let fast = layout.fast;
+    let fast = ctx.fast;
     let live = AtomicUsize::new(0);
-    let parts_fr: Vec<Maps<C>> = prev.fr
+    let mut parts: Vec<Maps<N>> = prev.fr
         .par_chunks(chunk)
-        .enumerate()
-        .map(|(i, rows)| {
-            let flav: &[Exps] = if layout.basis.is_some() { &prev.fr_flavor[i * chunk..i * chunk + rows.len()] } else { &[] };
-            products(rows, flav, true, itotal, layout, t_limit, deadline, cap, &live)
-        })
+        .map(|rows| products(rows, true, it, ctx, t_limit, deadline, cap, &live))
         .collect::<Result<Vec<_>, String>>()?;
-    let parts_fl: Vec<Maps<C>> = prev.fl
+    let parts_fl: Vec<Maps<N>> = prev.fl
         .par_chunks(chunk)
-        .map(|rows| products(rows, &[], false, itotal, layout, t_limit, deadline, cap, &live))
+        .map(|rows| products(rows, false, it, ctx, t_limit, deadline, cap, &live))
         .collect::<Result<Vec<_>, String>>()?;
-    let mut parts = parts_fr;
     parts.extend(parts_fl);
-    if parts.iter().map(|p| p.len()).sum::<usize>() > cap {
+    if parts.iter().map(|p| p.len()).sum::<usize>() > 2 * cap {
         return Err("__capacity__".into());
     }
-    // merge pairwise in parallel, then divide by k
     let merged = parts
         .into_par_iter()
         .map(Ok)
-        .reduce(|| Ok(Maps::new()), |a: Result<Maps<C>, String>, b| {
+        .reduce(|| Ok(Maps::new()), |a: Result<Maps<N>, String>, b| {
             check_deadline(deadline)?;
             let mut a = a?;
             let mut b = b?;
             if a.len() < b.len() {
-                merge_into(&mut b.fr, a.fr, fast)?;
-                merge_into(&mut b.fl, a.fl, fast)?;
-                Ok(b)
-            } else {
-                merge_into(&mut a.fr, b.fr, fast)?;
-                merge_into(&mut a.fl, b.fl, fast)?;
-                Ok(a)
+                std::mem::swap(&mut a, &mut b);
             }
+            merge_into(&mut a.fr, b.fr, fast)?;
+            merge_into(&mut a.fl, b.fl, fast)?;
+            Ok(a)
         })?;
-    let mut out = Maps::new();
+    let mut out = Power { fr: Vec::with_capacity(merged.fr.len()), fl: Vec::with_capacity(merged.fl.len()) };
     for (src, dst) in [(merged.fr, &mut out.fr), (merged.fl, &mut out.fl)] {
-        dst.reserve(src.len());
         for (key, c) in src {
             if c.is_zero() {
                 continue;
             }
-            dst.insert(key, c.over(k, fast)?);
+            dst.push((key, c.over(k, fast)?));
         }
     }
     Ok(out)
 }
 
-fn power_of<C: Coeff>(maps: Maps<C>, layout: &Layout) -> Result<Power<C>, String> {
-    let fr: Vec<Term<C>> = maps.fr.into_iter().collect();
-    let fr_flavor = if layout.basis.is_some() { fr.iter().map(|(e, _)| layout.flavor(e)).collect::<Result<Vec<_>, String>>()? } else { Vec::new() };
-    Ok(Power { fr, fr_flavor, fr_n: Vec::new(), fl: maps.fl.into_iter().collect(), fl_n: Vec::new() })
-}
-
-/// The truncated exponential: {monomial: coefficient} of the two kinds, the constant term included.
-fn exponential<C: Coeff>(terms: &[Term<C>], t_limit: i32, max_order: usize, layout: &Layout, deadline: Option<Instant>) -> Result<Maps<C>, String> {
-    let trace = std::env::var("LANDSCAPE_NATIVE_TRACE").is_ok();
-    let fast = layout.fast;
-    // itotal: the terms within the limit, sorted by t-power, in two lists when a basis is set
-    let mut itotal_fr: Vec<Term<C>> = Vec::new();
-    let mut itotal_fl: Vec<Term<C>> = Vec::new();
-    for (e, c) in terms.iter().filter(|(e, _)| e[0] <= t_limit) {
-        let above = layout.basis.is_some() && milli_exponent(e[0] as i64, e[1] as i64, e[2] as i64) as i64 > layout.project_above;
-        if above {
-            itotal_fl.push((layout.to_flavor(e)?, c.clone()));
-        } else {
-            itotal_fr.push((e.clone(), c.clone()));
-        }
-    }
-    itotal_fr.sort_by_key(|(e, _)| e[0]);
-    itotal_fl.sort_by_key(|(e, _)| e[0]);
-    let itotal_fr_flavor = if layout.basis.is_some() { itotal_fr.iter().map(|(e, _)| layout.flavor(e)).collect::<Result<Vec<_>, String>>()? } else { Vec::new() };
-    let itotal_fr_n: Vec<i64> = itotal_fr.iter().map(|(e, _)| weight_n(e)).collect();
-    let itotal_fl_n: Vec<i64> = itotal_fl.iter().map(|(e, _)| weight_n(e)).collect();
-    let itotal = Power { fr: itotal_fr, fr_flavor: itotal_fr_flavor, fr_n: itotal_fr_n, fl: itotal_fl, fl_n: itotal_fl_n };
-    let width_fr = 4 + layout.n_fields + layout.n_slots;
-    let mut result = Maps::new();
-    result.fr.insert(vec![0; width_fr], C::one());
-    let mut power = Power { fr: itotal.fr.clone(), fr_flavor: itotal.fr_flavor.clone(), fr_n: Vec::new(), fl: itotal.fl.clone(), fl_n: Vec::new() };
-    let cap = capacity();
-    for k in 1..=max_order {
-        if k > 1 {
-            let t0 = Instant::now();
-            let next = step(&power, &itotal, layout, t_limit, k as i128, deadline, cap)?;
-            power = power_of(next, layout)?;
-            if trace {
-                eprintln!("[series] k={k}: {} + {} terms, {:.3} s", power.fr.len(), power.fl.len(), t0.elapsed().as_secs_f64());
-            }
-            if power.fr.is_empty() && power.fl.is_empty() {
-                break;
-            }
-            let n = power.fr.len() + power.fl.len();
-            if n > cap || result.len() + n > cap {
-                return Err("__capacity__".into());
-            }
-        }
-        for (rows, dst) in [(&power.fr, &mut result.fr), (&power.fl, &mut result.fl)] {
-            for (row, (e, c)) in rows.iter().enumerate() {
-                if row % 65536 == 65535 {
-                    check_deadline(deadline)?;
-                }
-                match dst.get_mut(e) {
-                    Some(x) => {
-                        *x = x.plus(c, fast)?;
-                    }
-                    None => {
-                        dst.insert(e.clone(), c.clone());
-                    }
-                }
-            }
-        }
-        check_deadline(deadline)?;
-    }
-    result.fr.retain(|_, c| !c.is_zero());
-    result.fl.retain(|_, c| !c.is_zero());
-    Ok(result)
-}
-
-fn timeout_error(py: Python<'_>, timeout: Option<f64>) -> PyErr {
-    match py.import("subprocess").and_then(|m| m.getattr("TimeoutExpired")).and_then(|cls| cls.call1(("landscape_native.expand_series", timeout.unwrap_or(0.0)))) {
-        Ok(exc) => PyErr::from_value(exc),
-        Err(e) => e,
-    }
-}
-
+// --------------------------------------------------------------------------- //
+// the multiplicities and the rows
+// --------------------------------------------------------------------------- //
 /// The character product of a monomial's slot exponents as the projector's tuple, for the lookup.
 fn chars_of<'py>(py: Python<'py>, cexps: &[i32], slots: &[(usize, Vec<i64>, i64)], n_nodes: usize) -> PyResult<Bound<'py, PyAny>> {
     let mut per_node: Vec<BTreeMap<Vec<i64>, BTreeMap<i64, i64>>> = (0..n_nodes).map(|_| BTreeMap::new()).collect();
@@ -659,12 +673,270 @@ fn chars_of<'py>(py: Python<'py>, cexps: &[i32], slots: &[(usize, Vec<i64>, i64)
     crate::chars_object(py, &chars)
 }
 
+struct Mults<'a, 'py> {
+    py: Python<'py>,
+    lookup: &'a Bound<'py, PyAny>,
+    slots: &'a [(usize, Vec<i64>, i64)],
+    n_nodes: usize,
+    native: Option<Projector>,
+    timeout: Option<f64>,
+    verify: bool,
+    verified: usize,
+    fallback: usize,
+}
+
+impl<'a, 'py> Mults<'a, 'py> {
+    fn python(&self, cexps: &[i32]) -> PyResult<i128> {
+        let obj = chars_of(self.py, cexps, self.slots, self.n_nodes)?;
+        self.lookup.call1((obj,))?.extract()
+    }
+
+    fn get(&mut self, cexps: &[i32], deadline: Option<Instant>) -> PyResult<i128> {
+        let native = match self.native.as_mut() {
+            Some(p) => p.multiplicity(cexps, deadline).map_err(|m| engine_error(self.py, m, self.timeout))?,
+            None => None,
+        };
+        match native {
+            Some(m) => {
+                if self.verify {
+                    let want = self.python(cexps)?;
+                    if want != m {
+                        return Err(PyValueError::new_err(format!(
+                            "multiplicity check: the extension gives {m}, the projector {want}, for slot exponents {cexps:?}")));
+                    }
+                    self.verified += 1;
+                }
+                Ok(m)
+            }
+            None => {
+                self.fallback += 1;
+                self.python(cexps)
+            }
+        }
+    }
+}
+
+type Acc = FxHashMap<(i128, i64, Vec<i64>), Q>;
+
+/// The rows of one power, added into the accumulators: the terms above the limit dropped by their
+/// milli exponent, coefficient x multiplicity per (milli, y power, markers or flavor).
+#[allow(clippy::too_many_arguments)]
+fn accumulate<const N: usize>(power: &Power<N>, ctx: &Ctx<N>, limit: i64, mults: &mut Mults<'_, '_>, acc_fr: &mut Acc, acc_fl: &mut Acc,
+                              deadline: Option<Instant>) -> PyResult<()> {
+    for (fr, list) in [(true, &power.fr), (false, &power.fl)] {
+        if list.is_empty() {
+            continue;                   // without a basis the flavor-refined layout has no fields
+        }
+        let p = if fr { &ctx.pf } else { &ctx.pl };
+        let cstart = if fr { 4 + ctx.n_fields } else { 4 + ctx.rank };
+        let width = cstart + ctx.n_slots;
+        let acc = if fr { &mut *acc_fr } else { &mut *acc_fl };
+        // the distinct character products of this power, keyed by the words of their slot fields
+        let slot_mask = p.mask_from(cstart);
+        let mut seen: FxHashMap<[u64; N], i128> = FxHashMap::default();
+        for (row, (k, c)) in list.iter().enumerate() {
+            if row % 65536 == 65535 {
+                check_deadline(deadline).map_err(|m| engine_error(mults.py, m, mults.timeout))?;
+            }
+            let milli = milli_exponent(p.get(k, 0), p.get(k, 1), p.get(k, 2));
+            if milli > limit as i128 {
+                continue;
+            }
+            let mut ck = [0u64; N];
+            for i in 0..N {
+                ck[i] = k[i] & slot_mask[i];
+            }
+            let mult: i128 = if let Some(m) = seen.get(&ck) {
+                *m
+            } else {
+                let cexps: Vec<i32> = (cstart..width).map(|j| p.get(k, j) as i32).collect();
+                let m = if cexps.iter().all(|x| *x == 0) { 1 } else { mults.get(&cexps, deadline)? };
+                seen.insert(ck, m);
+                m
+            };
+            if mult == 0 {
+                continue;
+            }
+            let xs: Vec<i64> = (4..cstart).map(|j| p.get(k, j)).collect();
+            let cm = c.times_int(mult).map_err(PyValueError::new_err)?;
+            let key = (milli, p.get(k, 3), xs);
+            match acc.get_mut(&key) {
+                Some(x) => {
+                    *x = x.plus(&cm, false).map_err(PyValueError::new_err)?;
+                }
+                None => {
+                    acc.insert(key, cm);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn timeout_error(py: Python<'_>, timeout: Option<f64>) -> PyErr {
+    match py.import("subprocess").and_then(|m| m.getattr("TimeoutExpired")).and_then(|cls| cls.call1(("landscape_native.expand_series", timeout.unwrap_or(0.0)))) {
+        Ok(exc) => PyErr::from_value(exc),
+        Err(e) => e,
+    }
+}
+
+fn engine_error(py: Python<'_>, m: String, timeout: Option<f64>) -> PyErr {
+    if m == "__timeout__" {
+        return timeout_error(py, timeout);
+    }
+    if m == "__capacity__" {
+        return PyValueError::new_err(format!("capacity: the expansion exceeds {} monomials (LANDSCAPE_NATIVE_MAX_TERMS)", capacity()));
+    }
+    PyValueError::new_err(m)
+}
+
+// --------------------------------------------------------------------------- //
+// the engine
+// --------------------------------------------------------------------------- //
+struct Input<'a> {
+    terms: &'a [(i128, i128, Vec<i32>)],
+    t_limit: i64,
+    max_order: usize,
+    n_fields: usize,
+    slots: &'a [(usize, Vec<i64>, i64)],
+    n_nodes: usize,
+    limit: i64,
+    basis: Option<Vec<Vec<i64>>>,
+    exact: bool,
+    fast: bool,
+    lo_fr: Vec<i64>,
+    hi_fr: Vec<i64>,
+    lo_fl: Vec<i64>,
+    hi_fl: Vec<i64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run<'py, const N: usize>(py: Python<'py>, inp: &Input, lookup: &Bound<'py, PyAny>, groups: &Option<Vec<(String, String, usize)>>,
+                       timeout: Option<f64>, deadline: Option<Instant>, monomials: bool, native_rows: bool) -> PyResult<Py<PyAny>> {
+    let err = |m: String| engine_error(py, m, timeout);
+    let rank = inp.basis.as_ref().map(|b| b.len()).unwrap_or(0);
+    let ctx: Ctx<N> = Ctx {
+        pf: Packer::new(&inp.lo_fr, &inp.hi_fr).map_err(err)?,
+        pl: Packer::new(&inp.lo_fl, &inp.hi_fl).map_err(err)?,
+        n_fields: inp.n_fields,
+        n_slots: inp.slots.len(),
+        basis: inp.basis.clone(),
+        rank,
+        above_n: threshold_n(6000),
+        limit_n: threshold_n(inp.limit),
+        exact: inp.exact,
+        fast: inp.fast,
+    };
+    let trace = std::env::var("LANDSCAPE_NATIVE_TRACE").is_ok();
+    let verify = std::env::var("LANDSCAPE_NATIVE_VERIFY_MULT").map(|v| v.trim() == "1").unwrap_or(false);
+    // itotal: the terms within the limit, sorted by t-power, in two lists when a basis is set
+    let mut sorted: Vec<&(i128, i128, Vec<i32>)> = inp.terms.iter().filter(|(_, _, e)| e[0] as i64 <= inp.t_limit).collect();
+    sorted.sort_by_key(|(_, _, e)| e[0]);
+    let mut it = Letters { fr: Vec::new(), fr_t: Vec::new(), fr_n: Vec::new(), fr_img: Vec::new(), fl: Vec::new(), fl_t: Vec::new(), fl_n: Vec::new() };
+    for (n, d, e) in sorted {
+        let v: Vec<i64> = e.iter().map(|x| *x as i64).collect();
+        let c = Q::from_pair(*n, *d).map_err(err)?;
+        let above = ctx.basis.is_some() && milli_exponent(v[0], v[1], v[2]) as i64 > 6000;
+        let wn = weight_n(v[0], v[1], v[2]);
+        if above {
+            it.fl.push((ctx.pl.pack(&ctx.to_flavor(&v).map_err(err)?), c));
+            it.fl_t.push(v[0]);
+            it.fl_n.push(wn);
+        } else {
+            let key = ctx.pf.pack(&v);
+            if ctx.basis.is_some() {
+                it.fr_img.push(ctx.pl.pack(&ctx.to_flavor(&v).map_err(err)?));
+            }
+            it.fr.push((key, c));
+            it.fr_t.push(v[0]);
+            it.fr_n.push(wn);
+        }
+    }
+    // the multiplicities: the extension, the Python projector as the fallback and the check
+    let native = match groups {
+        Some(g) => Projector::new(g, inp.slots, deadline).map_err(err)?,
+        None => None,
+    };
+    let mut mults = Mults { py, lookup, slots: inp.slots, n_nodes: inp.n_nodes, native, timeout, verify, verified: 0, fallback: 0 };
+    let mut acc_fr: Acc = FxHashMap::default();
+    let mut acc_fl: Acc = FxHashMap::default();
+    let mut result: Map<N> = FxHashMap::default();
+    // the constant term
+    let zero_fr = ctx.pf.pack(&vec![0i64; 4 + inp.n_fields + inp.slots.len()]);
+    acc_fr.insert((0, 0, vec![0i64; inp.n_fields]), Q::one());
+    if monomials {
+        result.insert(zero_fr, Q::one());
+    }
+    let cap = capacity();
+    let t_exp = Instant::now();
+    let mut power = Power { fr: it.fr.clone(), fl: it.fl.clone() };
+    for k in 1..=inp.max_order {
+        if k > 1 {
+            let t0 = Instant::now();
+            let prev = std::mem::replace(&mut power, Power { fr: Vec::new(), fl: Vec::new() });
+            let next = py.allow_threads(|| step(&prev, &it, &ctx, inp.t_limit, k as i128, deadline, cap));
+            drop(prev);
+            power = next.map_err(err)?;
+            if trace {
+                eprintln!("[series] k={k}: {} + {} terms, {:.3} s", power.fr.len(), power.fl.len(), t0.elapsed().as_secs_f64());
+            }
+            if power.len() == 0 {
+                break;
+            }
+            if power.len() > cap || (monomials && result.len() + power.len() > cap) {
+                return Err(err("__capacity__".into()));
+            }
+        }
+        if monomials {
+            for (key, c) in power.fr.iter() {
+                insert(&mut result, *key, c.clone(), ctx.fast).map_err(err)?;
+            }
+        } else {
+            accumulate(&power, &ctx, inp.limit, &mut mults, &mut acc_fr, &mut acc_fl, deadline)?;
+        }
+        check_deadline(deadline).map_err(err)?;
+    }
+    drop(power);
+    if trace {
+        eprintln!("[series] exponential {:.3} s", t_exp.elapsed().as_secs_f64());
+    }
+    if verify {
+        eprintln!("[mult] verified {}, fallback {}", mults.verified, mults.fallback);
+    }
+    if monomials {
+        let out = PyList::empty(py);
+        let mut rows: Vec<(Vec<i64>, &Q)> = result.iter().filter(|(_, c)| !c.is_zero()).map(|(k, c)| (ctx.pf.unpack(k), c)).collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        for (e, c) in rows {
+            let (n, d) = c.big_pair();
+            out.append((n, d, PyList::new(py, e.iter().map(|x| *x as i32))?))?;
+        }
+        return Ok(out.into_any().unbind());
+    }
+    // integral after the projection: back to 128 bits (a row beyond raises the overflow; the caller's FORM path follows)
+    let pairs = |acc: Acc| -> PyResult<Vec<((i128, i64, Vec<i64>), Coef)>> {
+        let mut rows = Vec::with_capacity(acc.len());
+        for (k, c) in acc {
+            if !c.is_zero() {
+                rows.push((k, c.pair().map_err(PyValueError::new_err)?));
+            }
+        }
+        rows.sort();
+        Ok(rows)
+    };
+    let rows_fr = pairs(acc_fr)?;
+    let rows_fl = pairs(acc_fl)?;
+    crate::post::emit_rows(py, rows_fr, rows_fl, inp.n_fields, inp.basis.clone(), native_rows)
+}
+
 /// expand_series(terms, t_limit, max_order, n_fields, slots, n_nodes, t_order, lookup, timeout, monomials, native_rows,
-///               basis, exact, coef64): the rows as a FieldResolvedRows object when native_rows is set (the native
-/// post-processing pass reads them there; with a basis, the only form); see the module.
+///               basis, exact, coef64, groups): the rows as a FieldResolvedRows object when native_rows is set (the
+/// native post-processing pass reads them there; with a basis, the only form); see the module.  `groups[node]` =
+/// (LiE group name, type letter, rank) of the node's store, for the multiplicities in the extension; without it
+/// every multiplicity comes from `lookup`.
 #[pyfunction]
 #[pyo3(signature = (terms, t_limit, max_order, n_fields, slots, n_nodes, t_order, lookup, timeout=None, monomials=false, native_rows=false,
-                    basis=None, exact=false, coef64=false))]
+                    basis=None, exact=false, coef64=false, groups=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn expand_series<'py>(
     py: Python<'py>,
@@ -682,6 +954,7 @@ pub fn expand_series<'py>(
     basis: Option<Vec<Vec<i64>>>,
     exact: bool,
     coef64: bool,
+    groups: Option<Vec<(String, String, usize)>>,
 ) -> PyResult<Py<PyAny>> {
     let deadline = timeout.map(|t| Instant::now() + std::time::Duration::from_secs_f64(t.max(0.0)));
     let width = 4 + n_fields + slots.len();
@@ -693,135 +966,55 @@ pub fn expand_series<'py>(
             return Err(PyValueError::new_err("exponent vector of the wrong length"));
         }
     }
-    let limit: i64 = 1000 * t_order;
-    let layout = Layout { n_fields, n_slots: slots.len(), rank: basis.as_ref().map(|b| b.len()).unwrap_or(0), basis,
-                          project_above: 6000, above_n: threshold_n(6000), limit_n: threshold_n(limit), exact, fast: coef64 };
     crate::lie::init_pool();
-    let trace = std::env::var("LANDSCAPE_NATIVE_TRACE").is_ok();
-    let t_exp = Instant::now();
-    // the 128-bit engine first; on a coefficient overflow the same expansion with arbitrary precision (step 54)
-    let small = py.allow_threads(|| series_of::<Coef>(&terms).and_then(|s| exponential(&s, t_limit, max_order, &layout, deadline)));
-    let out = match small {
-        // the 128-bit rows' sums may overflow where the expansion did not: the rows again from the same expansion, exactly
-        Ok(r) => match finish(py, &r, monomials, native_rows, &layout, &slots, n_nodes, n_fields, limit, &lookup) {
-            Err(e) if e.to_string().contains(COEF_OVERFLOW) => {
-                let r = to_big(&r).map_err(PyValueError::new_err)?;
-                finish(py, &r, monomials, native_rows, &layout, &slots, n_nodes, n_fields, limit, &lookup)
-            }
-            other => other,
-        },
-        Err(m) if m == COEF_OVERFLOW => {
-            if trace {
-                eprintln!("[series] 128-bit overflow after {:.3} s: arbitrary precision", t_exp.elapsed().as_secs_f64());
-            }
-            let big = py.allow_threads(|| series_of::<Big>(&terms).and_then(|s| exponential(&s, t_limit, max_order, &layout, deadline)));
-            match big {
-                Ok(r) => finish(py, &r, monomials, native_rows, &layout, &slots, n_nodes, n_fields, limit, &lookup),
-                Err(m) => Err(engine_error(py, m, timeout)),
-            }
-        }
-        Err(m) => Err(engine_error(py, m, timeout)),
-    };
-    if trace {
-        eprintln!("[series] exponential {:.3} s", t_exp.elapsed().as_secs_f64());
-    }
-    out
-}
-
-fn to_big<C: Coeff>(m: &Maps<C>) -> Result<Maps<Big>, String> {
-    let conv = |src: &Map<C>| -> Result<Map<Big>, String> {
-        let mut out: Map<Big> = FxHashMap::default();
-        out.reserve(src.len());
-        for (e, c) in src {
-            let (n, d) = c.big();
-            out.insert(e.clone(), Big::reduced(n, d)?);
-        }
-        Ok(out)
-    };
-    Ok(Maps { fr: conv(&m.fr)?, fl: conv(&m.fl)? })
-}
-
-fn series_of<C: Coeff>(terms: &[(i128, i128, Vec<i32>)]) -> Result<Vec<Term<C>>, String> {
-    terms.iter().map(|(n, d, e)| Ok((e.clone(), C::from_pair(*n, *d)?))).collect()
-}
-
-fn engine_error(py: Python<'_>, m: String, timeout: Option<f64>) -> PyErr {
-    if m == "__timeout__" {
-        return timeout_error(py, timeout);
-    }
-    if m == "__capacity__" {
-        return PyValueError::new_err(format!("capacity: the expansion exceeds {} monomials (LANDSCAPE_NATIVE_MAX_TERMS)", capacity()));
-    }
-    PyValueError::new_err(m)
-}
-
-/// The polynomial (monomials) or the rows of the two kinds from the truncated exponential.
-#[allow(clippy::too_many_arguments)]
-fn finish<'py, C: Coeff>(py: Python<'py>, result: &Maps<C>, monomials: bool, native_rows: bool, layout: &Layout,
-                          slots: &[(usize, Vec<i64>, i64)], n_nodes: usize, n_fields: usize, limit: i64,
-                          lookup: &Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
-    if monomials {
-        let out = PyList::empty(py);
-        let mut rows: Vec<(&Exps, &C)> = result.fr.iter().collect();
-        rows.sort_by(|a, b| a.0.cmp(b.0));
-        for (e, c) in rows {
-            let (n, d) = c.big();
-            out.append((n, d, PyList::new(py, e.iter().copied())?))?;
-        }
-        return Ok(out.into_any().unbind());
-    }
-    // the rows of the two kinds
-    let rank = layout.rank;
-    let mut mults: FxHashMap<Vec<i32>, i128> = FxHashMap::default();
-    let mut acc_fr: FxHashMap<(i128, i64, Vec<i64>), C> = FxHashMap::default();
-    let mut acc_fl: FxHashMap<(i128, i64, Vec<i64>), C> = FxHashMap::default();
-    for (fr, map) in [(true, &result.fr), (false, &result.fl)] {
-        let cstart = if fr { 4 + n_fields } else { 4 + rank };
-        for (e, c) in map.iter() {
-            let milli = milli_exponent(e[0] as i64, e[1] as i64, e[2] as i64);
-            if milli > limit as i128 {
-                continue;
-            }
-            let cexps: Vec<i32> = e[cstart..].to_vec();
-            let mult: i128 = if cexps.iter().all(|x| *x == 0) {
-                1
-            } else if let Some(m) = mults.get(&cexps) {
-                *m
-            } else {
-                let obj = chars_of(py, &cexps, slots, n_nodes)?;
-                let m: i128 = lookup.call1((obj,))?.extract()?;
-                mults.insert(cexps.clone(), m);
-                m
-            };
-            if mult == 0 {
-                continue;
-            }
-            let xs: Vec<i64> = e[4..cstart].iter().map(|x| *x as i64).collect();
-            let cm = c.times_int(mult).map_err(PyValueError::new_err)?;
-            let key = (milli, e[3] as i64, xs);
-            let acc = if fr { &mut acc_fr } else { &mut acc_fl };
-            match acc.get_mut(&key) {
-                Some(x) => {
-                    *x = x.plus(&cm, false).map_err(PyValueError::new_err)?;
+    // the bounds of the two layouts from the letters within the limit
+    let letters: Vec<Vec<i64>> = terms.iter().filter(|(_, _, e)| e[0] <= t_limit).map(|(_, _, e)| e.iter().map(|x| *x as i64).collect()).collect();
+    let (lo_fr, hi_fr) = field_bounds(&letters, t_limit as i64, max_order as i64);
+    let (lo_fl, hi_fl) = match &basis {
+        Some(b) => {
+            let rank = b.len();
+            let mut images = Vec::with_capacity(letters.len());
+            for e in &letters {
+                let mut v = Vec::with_capacity(4 + rank + slots.len());
+                v.extend_from_slice(&e[..4]);
+                for row in b {
+                    let mut s: i64 = 0;
+                    for (x, y) in row.iter().zip(e[4..4 + n_fields].iter()) {
+                        s = s.checked_add(x.checked_mul(*y).ok_or_else(|| PyValueError::new_err("overflow"))?)
+                            .ok_or_else(|| PyValueError::new_err("overflow"))?;
+                    }
+                    v.push(s);
                 }
-                None => {
-                    acc.insert(key, cm);
-                }
+                v.extend_from_slice(&e[4 + n_fields..]);
+                images.push(v);
             }
+            field_bounds(&images, t_limit as i64, max_order as i64)
         }
-    }
-    // integral after the projection: back to 128 bits (a row beyond raises the overflow; the caller's FORM path follows)
-    let pairs = |acc: FxHashMap<(i128, i64, Vec<i64>), C>| -> PyResult<Vec<((i128, i64, Vec<i64>), Coef)>> {
-        let mut rows = Vec::with_capacity(acc.len());
-        for (k, c) in acc {
-            if !c.is_zero() {
-                rows.push((k, c.pair().map_err(PyValueError::new_err)?));
-            }
-        }
-        rows.sort();
-        Ok(rows)
+        None => (Vec::new(), Vec::new()),
     };
-    let rows_fr = pairs(acc_fr)?;
-    let rows_fl = pairs(acc_fl)?;
-    crate::post::emit_rows(py, rows_fr, rows_fl, n_fields, layout.basis.clone(), native_rows)
+    let words = field_layout(&lo_fr, &hi_fr).map_err(|m| engine_error(py, m, timeout))?.1
+        .max(field_layout(&lo_fl, &hi_fl).map_err(|m| engine_error(py, m, timeout))?.1);
+    let inp = Input { terms: &terms, t_limit: t_limit as i64, max_order, n_fields, slots: &slots, n_nodes, limit: 1000 * t_order, basis,
+                      exact, fast: coef64, lo_fr, hi_fr, lo_fl, hi_fl };
+    macro_rules! go {
+        ($n:literal) => {
+            run::<$n>(py, &inp, &lookup, &groups, timeout, deadline, monomials, native_rows)
+        };
+    }
+    match words {
+        0..=1 => go!(1),
+        2 => go!(2),
+        3 => go!(3),
+        4 => go!(4),
+        5 => go!(5),
+        6 => go!(6),
+        7 => go!(7),
+        8 => go!(8),
+        9..=10 => go!(10),
+        11..=12 => go!(12),
+        13..=16 => go!(16),
+        17..=24 => go!(24),
+        25..=32 => go!(32),
+        _ => Err(engine_error(py, "__capacity__".into(), timeout)),
+    }
 }

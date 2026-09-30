@@ -185,7 +185,7 @@ pub struct Group {
     #[allow(dead_code)]
     pub name: String,
     pub rank: usize,
-    alpha: Vec<Vec<i64>>,      // row i = alpha_i in Dynkin coordinates
+    pub(crate) alpha: Vec<Vec<i64>>,      // row i = alpha_i in Dynkin coordinates
     qi: Vec<Vec<i64>>,         // scaled symmetrized inverse Cartan form: (w, v) = w Qi v / L
     roots: Vec<Vec<i64>>,      // positive roots, Dynkin coordinates
     rq: Vec<Vec<i64>>,         // roots @ Qi
@@ -196,7 +196,7 @@ pub struct Group {
 }
 
 impl Group {
-    fn new(name: &str) -> Result<Group, String> {
+    pub(crate) fn new(name: &str) -> Result<Group, String> {
         let mut chars = name.chars();
         let typ = chars.next().ok_or("bad group name")?;
         let rank: usize = chars.as_str().parse().map_err(|_| format!("bad group name {name:?}"))?;
@@ -390,7 +390,7 @@ impl Group {
     }
 
     /// Dominant weights of V_lam with multiplicities (Freudenthal).
-    fn domchar(&mut self, lam: &[i64], deadline: Option<Instant>) -> Result<BTreeMap<Weight, i64>, String> {
+    pub(crate) fn domchar(&mut self, lam: &[i64], deadline: Option<Instant>) -> Result<BTreeMap<Weight, i64>, String> {
         if let Some(m) = self.memo_domchar.get(lam) {
             return Ok(m.clone());
         }

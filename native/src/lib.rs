@@ -46,6 +46,7 @@
 
 mod lie;
 mod post;
+mod project;
 mod series;
 
 use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
@@ -424,6 +425,6 @@ fn landscape_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lie::lie_dim, m)?)?;
     m.add_function(wrap_pyfunction!(series::expand_series, m)?)?;
     m.add_class::<post::FieldResolvedRows>()?;
-    m.add("__version__", "0.7.0")?;
+    m.add("__version__", "0.8.0")?;
     Ok(())
 }

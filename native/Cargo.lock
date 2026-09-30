@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "landscape_native"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "num-bigint",
  "num-integer",
