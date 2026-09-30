@@ -31,6 +31,8 @@ Every record is a JSON document validated against `landscape/schema/record.schem
 - [FORM](https://www.nikhef.nl/~form/) (`form`, and `tform` for the parallel path) on `PATH`
 - [LiE](http://wwwmathlabo.univ-poitiers.fr/~maavl/LiE/) (`lie`) on `PATH`
 
+With the native extension below, FORM and LiE are needed only for its fallbacks.
+
 No Mathematica and no database server are needed. The character store is a sqlite file
 per gauge group, created automatically and filled on demand through LiE.
 
@@ -40,7 +42,7 @@ pip install .
 
 ## Optional native extension
 
-The package runs on Python alone. The `native/` directory holds an optional Rust extension,
+The package runs without it, on Python with FORM and LiE (the requirements above). The `native/` directory holds an optional Rust extension,
 `landscape_native` (PyO3), that the package uses when it is importable:
 
 - the FORM-output parser and the combined expansion pass (parse, singlet lookups and the
