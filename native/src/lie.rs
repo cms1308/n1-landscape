@@ -190,7 +190,7 @@ pub struct Group {
     roots: Vec<Vec<i64>>,      // positive roots, Dynkin coordinates
     rq: Vec<Vec<i64>>,         // roots @ Qi
     rho_ip: Vec<i64>,          // (rho, alpha) scaled, per positive root
-    hvec: Vec<i128>,           // height of a weight in simple-root coordinates, scaled by hden
+    pub(crate) hvec: Vec<i128>, // height of a weight in simple-root coordinates, scaled by hden
     memo_domchar: HashMap<Weight, BTreeMap<Weight, i64>>,
     memo_dim: HashMap<Weight, i128>,
 }
@@ -904,6 +904,26 @@ fn timeout_error(py: Python<'_>, timeout: Option<f64>) -> PyErr {
         Ok(exc) => PyErr::from_value(exc),
         Err(e) => e,
     }
+}
+
+/// dom_char(group, label) -> [(dominant weight, multiplicity)], the dominant character by Freudenthal's recursion -- what
+/// LiE's `dom_char` prints -- in place of the LiE call of `landscape.lie.lie_dom_char` (step 59); ValueError for a group
+/// outside the engine, and the caller asks LiE.
+#[pyfunction]
+pub fn dom_char(py: Python<'_>, group: &str, label: Vec<i64>) -> PyResult<Vec<(Vec<i64>, i64)>> {
+    py.allow_threads(|| {
+        let mut guard = GROUPS.lock().unwrap();
+        let groups = guard.get_or_insert_with(HashMap::new);
+        if !groups.contains_key(group) {
+            groups.insert(group.to_string(), Group::new(group)?);
+        }
+        let g = groups.get_mut(group).unwrap();
+        if label.len() != g.rank {
+            return Err("weight length does not match the group rank".to_string());
+        }
+        g.domchar(&label, None).map(|m| m.into_iter().filter(|(_, c)| *c != 0).collect())
+    })
+    .map_err(PyValueError::new_err)
 }
 
 /// lie_dim(group, label) -> int, the Weyl dimension (a check of the group data).

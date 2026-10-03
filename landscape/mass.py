@@ -3,8 +3,8 @@
 A mass term is a superpotential monomial of degree two: a*b of two fields or a^2 of one.  Its
 fields have R-charges summing to 2, conjugate gauge representations and opposite flavor
 charges, so their letters cancel in the flavor-refined index (the boson of one against the
-fermion of the other).  The index expansion leaves them out (`form.program`,
-`form.itotal_terms`), and the post-processing names operators by the remaining fields: its
+fermion of the other).  The index expansion leaves them out
+(`form.itotal_terms`), and the post-processing names operators by the remaining fields: its
 F-term rules and its superpotential rule at t^6 read `effective_superpotential`, the
 superpotential with the massive fields replaced by the solutions of their F-term equations.
 The theory, its superpotential and the a-maximization are not changed.

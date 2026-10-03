@@ -21,10 +21,9 @@ and errors files are append-only logs: a trailing fragment left by a killed writ
 truncated away before the next append (its input runs again), a malformed line anywhere
 else is an explicit failure naming the file and the line.  Only the pending inputs run.
 
-Each worker process opens its own character stores (sqlite, WAL) and its own FORM runner
-(per-process TempDir under out_dir/frm); LiE runs as a subprocess per call
-(landscape.store.run_lie by default).  A projector or FORM timeout makes the
-record `index-not-computed`.
+Each worker process opens its own character stores (sqlite, WAL); every expansion runs in the native
+extension.  An expansion that forms more product terms than form.WORK_BOUND (or, as a safety net, runs past
+form.EXPANSION_TIMEOUT_S) makes the record `index-not-computed`.
 """
 from __future__ import annotations
 
@@ -46,23 +45,28 @@ _W: Dict[str, object] = {}
 
 
 class _Engine:
-    """IndexEngine proxy: None on a LiE-chain timeout (FORM timeouts already return None)."""
+    """IndexEngine proxy: None on a timeout the engine raises (its expansions past the deadline already return None)."""
 
     def __init__(self, eng):
         self.eng = eng
+        self.stop = None
 
-    def expansion(self, th, charges, t_order, basis=None):
+    def expansion(self, th, charges, t_order, basis=None, **kw):
+        """The engine's expansion; `stop` the cause of a None (IndexEngine.stop)."""
+        self.stop = None
         try:
-            return self.eng.expansion(th, charges, t_order, basis=basis)
+            out = self.eng.expansion(th, charges, t_order, basis=basis, **kw)
         except subprocess.TimeoutExpired:
+            self.stop = {"cause": "deadline"}
             return None
+        self.stop = getattr(self.eng, "stop", None)
+        return out
 
 
 def _init(cfg: dict) -> None:
     th0 = Theory([Node(t, int(r)) for t, r in cfg["nodes"]], [], [])
     stores = index.open_stores(th0, cfg["store_dir"])
-    eng = index.IndexEngine(stores, Path(cfg["out_dir"]) / "frm", core=cfg["projector_core"],
-                            tform_workers=cfg["tform_workers"], match_timeout=cfg["match_timeout"])
+    eng = index.IndexEngine(stores, match_timeout=cfg["match_timeout"])
     _W["engine"] = _Engine(eng)
     _W["cfg"] = cfg
 
@@ -190,7 +194,7 @@ def _load_final(out: Path, L: int, inputs: Sequence[dict], errors: Sequence[dict
 # the run
 # --------------------------------------------------------------------------- #
 def run(seed: Theory, out_dir, levels: int, *, name: str, store_dir, t_order: int = 9, low_order: int = 3,
-        core: Optional[int] = None, tform_workers: int = 4, projector_core: int = 1, match_timeout: float = 600.0,
+        core: Optional[int] = None, match_timeout: float = 600.0,
         stop_after: Optional[Tuple[int, int]] = None, log=print) -> dict:
     """Run `seed` through levels 0..levels; resumable.  `stop_after = (L, k)` stops the run
     once level L holds k records (for the resumability check) and reports `interrupted`.
@@ -200,7 +204,7 @@ def run(seed: Theory, out_dir, levels: int, *, name: str, store_dir, t_order: in
     out = Path(out_dir)
     cfg = {"seed": name, "seed_theory": seed.to_json(), "nodes": [[n.type, n.rank] for n in seed.nodes],
            "store_dir": str(store_dir), "out_dir": str(out), "t_order": t_order, "low_order": low_order,
-           "tform_workers": tform_workers, "projector_core": projector_core, "match_timeout": match_timeout}
+           "match_timeout": match_timeout}
     cfg_path = out / "config.json"
     if cfg_path.exists():
         old = json.loads(cfg_path.read_text())

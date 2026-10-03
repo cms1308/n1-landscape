@@ -10,12 +10,12 @@ with alias-conflict detection before insertion and a provenance row per migratio
 
 Any highest weight is admissible: a missing key is generated on the spot by the arxivGen
 recursion (pure top Adams key -> Adams(N, label, G); otherwise one tensor of two strictly
-lower-order entries) and persisted -- the LiE conventions (banner sentinel, maxnodes/maxobjects preamble,
-maxobjects retry, process-group kill on timeout, output validated against the
-character-polynomial regex) are those of the original character tables, against which
-the generated entries were verified byte-identical.  LiE has no C1/B1: the
-group name of every LiE call comes from lie.lie_group_name (C1 -> A1, same labels),
-while the store key keeps the node's own group_rank.
+lower-order entries) and persisted, computed by the native character engine, which prints LiE's
+output byte for byte -- the LiE conventions (banner sentinel, maxnodes/maxobjects preamble,
+maxobjects retry, output validated against the character-polynomial regex) are those of the
+original character tables, against which the generated entries were verified byte-identical.
+LiE has no C1/B1: the group name of every lcode comes from lie.lie_group_name (C1 -> A1, same
+labels), while the store key keeps the node's own group_rank.
 
 The tensor-step cache is keyed by sha256(group_rank|products|decomp), so caches migrated
 from the original pipeline stay valid for the projector of landscape/singlet.py.
@@ -26,9 +26,7 @@ import hashlib
 import json
 import os
 import re
-import signal
 import sqlite3
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -36,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import lie
 
-LIE_TIMEOUT_S = 180.0        # per LiE subprocess
+LIE_TIMEOUT_S = 180.0        # per lcode
 MAX_OBJECTS_RETRIES = 3      # grow maxobjects and rerun
 BANNER_SLICE = 53            # LiE startup banner length, sentinel-verified
 BUSY_TIMEOUT_MS = 60_000     # sqlite lock wait across Pool processes
@@ -92,60 +90,14 @@ def parse_group_rank(group_rank: str) -> Tuple[str, int]:
     return group_rank[0], int(group_rank[1:])
 
 
-try:                                            # the optional native extension (landscape_native, Rust)
-    import landscape_native as _native
-except ImportError:
-    _native = None
-
-# The native character engine answers the Adams/tensor lcode forms when the extension has it
-# and LANDSCAPE_NATIVE_LIE is not 0/off/no (on by default since its gate passed: byte-identical
-# to LiE on the R18 manifest and the stores, faster on every witness and on the cold pass); any
-# other lcode, and NotImplementedError from the engine, go to the LiE subprocess.
-NATIVE_LIE = (_native is not None and hasattr(_native, "lie_run")
-              and os.environ.get("LANDSCAPE_NATIVE_LIE", "1").strip().lower() not in ("0", "off", "no", ""))
-
-
-def native_lie_available() -> bool:
-    return _native is not None and hasattr(_native, "lie_run")
-
-
-def run_lie_native(lcode: str, timeout: float) -> str:
-    """The native engine's stdout for a supported lcode; NotImplementedError otherwise;
-    subprocess.TimeoutExpired past the timeout."""
-    return _native.lie_run(lcode, timeout)
+import landscape_native as _native                                              # noqa: E402
 
 
 def run_lie(lcode: str, timeout: float) -> str:
-    """LiE's stdout for an lcode: the native engine when NATIVE_LIE is set and the form is
-    supported, else the LiE subprocess with the pipeline's kill semantics."""
-    if NATIVE_LIE:
-        try:
-            return _native.lie_run(lcode, timeout)
-        except NotImplementedError:
-            pass
-    return run_lie_subprocess(lcode, timeout)
-
-
-def run_lie_subprocess(lcode: str, timeout: float) -> str:
-    """LiE subprocess with the pipeline's kill semantics."""
-    proc = subprocess.Popen(
-        ["lie"], shell=True,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
-    )
-    try:
-        out, _ = proc.communicate(input=lcode, timeout=timeout)
-        return out
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        raise
+    """The native character engine's stdout for an lcode of the store or the projector (`Adams` and
+    two-argument `tensor` with the maxnodes banner line), as LiE prints it; NotImplementedError for any
+    other lcode; subprocess.TimeoutExpired past the timeout."""
+    return _native.lie_run(lcode, timeout)
 
 
 def split_key(key: Sequence[int]) -> Tuple[list, list]:

@@ -3,7 +3,7 @@
 //! extension.
 //!
 //! `FieldResolvedRows` holds the rows (coefficient, milli exponent, y power, marker exponents)
-//! that the expansion engine or the combined pass produced -- one row per (milli, y, markers),
+//! that the expansion engine produced -- one row per (milli, y, markers),
 //! sorted, integer coefficients, none zero -- and answers:
 //!
 //!   * `reduce(basis, milli_limit, block_limit)` -> (vanishing, fullpower, blocks, index2, net):
@@ -43,6 +43,7 @@ use std::hash::Hash;
 
 const KERNEL: [(i64, i64, i128); 4] = [(0, 0, 1), (3000, 1, -1), (3000, -1, -1), (6000, 0, 1)];
 
+#[derive(Clone)]
 pub struct Row {
     pub coeff: i128,
     pub milli: i64,
@@ -50,6 +51,7 @@ pub struct Row {
     pub markers: Vec<i64>,
 }
 
+#[derive(Clone)]
 pub struct FlavorRow {
     pub coeff: i128,
     pub milli: i64,
@@ -69,13 +71,21 @@ fn overflow() -> PyErr {
     PyOverflowError::new_err("coefficient overflow in the native post-processing")
 }
 
+/// A sum or product of the pass: an overflow, or a value beyond the test hook's bits (series::within_test_bits), raises.
+fn within(x: Option<i128>) -> PyResult<i128> {
+    match x {
+        Some(v) if crate::series::within_test_bits(v) => Ok(v),
+        _ => Err(overflow()),
+    }
+}
+
 fn add_to<K: Hash + Eq>(map: &mut FxHashMap<K, i128>, key: K, c: i128) -> PyResult<()> {
     match map.get_mut(&key) {
         Some(e) => {
-            *e = e.checked_add(c).ok_or_else(overflow)?;
+            *e = within(e.checked_add(c))?;
         }
         None => {
-            map.insert(key, c);
+            map.insert(key, within(Some(c))?);
         }
     }
     Ok(())
@@ -233,6 +243,19 @@ impl FieldResolvedRows {
         Ok((r.coeff, r.milli, r.ypow, int_tuple(py, &r.markers)?))
     }
 
+    /// This object's flavor-refined rows (above t^6) with the field-resolved rows of `below` (an expansion of order 6
+    /// with the same basis): the splice of an expansion computed flavor-refined throughout (`flavor_only`) with the
+    /// order-6 expansion, whose rows through t^6 are the same terms.
+    fn spliced(&self, below: PyRef<'_, FieldResolvedRows>) -> PyResult<FieldResolvedRows> {
+        if below.n_fields != self.n_fields || below.basis != self.basis || !below.frows.is_empty() {
+            return Err(PyValueError::new_err("splice: the order-6 expansion does not match (fields, basis or rows above t^6)"));
+        }
+        if self.frows.iter().any(|r| r.milli <= 6000) {
+            return Err(PyValueError::new_err("splice: a flavor-refined row at or below t^6"));
+        }
+        Ok(FieldResolvedRows { n_fields: self.n_fields, rows: below.rows.clone(), frows: self.frows.clone(), basis: self.basis.clone() })
+    }
+
     /// Every row as (numerator, 1, milli, y, markers), the format of the combined pass.
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         self.only_field_resolved()?;
@@ -289,7 +312,7 @@ impl FieldResolvedRows {
             };
             for (dm, dy, s) in KERNEL {
                 let m = r.milli + dm;
-                let c = s.checked_mul(r.coeff).ok_or_else(overflow)?;
+                let c = within(s.checked_mul(r.coeff))?;
                 add_to(&mut net, (m, r.ypow + dy), c)?;
                 if m < milli_limit {
                     add_to(&mut out, (m, r.ypow + dy, id), c)?;
@@ -332,7 +355,7 @@ impl FieldResolvedRows {
             for r in &self.frows {
                 for (dm, dy, s) in KERNEL {
                     let m = r.milli + dm;
-                    let c = s.checked_mul(r.coeff).ok_or_else(overflow)?;
+                    let c = within(s.checked_mul(r.coeff))?;
                     add_to(&mut net, (m, r.ypow + dy), c)?;
                     if m < milli_limit {
                         add_to(&mut out_fl, (m, r.ypow + dy, r.flavor.clone()), c)?;

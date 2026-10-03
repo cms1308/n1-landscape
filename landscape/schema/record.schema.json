@@ -71,17 +71,17 @@
     "provenance": {"type": "object"},
     "analysis": {
       "type": "object",
-      "required": ["consistency", "dim3", "nonmanifest_symmetry", "susy_enhanced", "flags"],
+      "required": ["consistency", "dim3", "nonmanifest_symmetry", "extra_supercurrents", "flags"],
       "additionalProperties": false,
       "description": "results of the post-processing that are neither operators nor the verdict",
       "properties": {
         "consistency": {"type": "string", "description": "C1/C2 of the old Index check alone, before C1'/C3 and the central-charge bounds"},
         "dim3": {"anyOf": [{"type": "integer"}, {"type": "null"}], "description": "t^6 coefficient of the unrefined scalar part of the reduced index"},
-        "nonmanifest_symmetry": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
-        "susy_enhanced": {"type": "boolean", "description": "C3 at j = 1/2: extra supercurrent signal"},
+        "nonmanifest_symmetry": {"anyOf": [{"type": "boolean"}, {"type": "null"}], "description": "a flavor symmetry beyond the manifest U(1)s that the index proves: at t^6 and y^0 of the scalar part of the flavor-refined reduced index, a negative coefficient at a charge q != 0 or the neutral coefficient plus the number of manifest U(1)s negative (a lower bound; null where the operator extraction does not run)"},
+        "extra_supercurrents": {"type": "integer", "minimum": 0, "description": "at least this many extra supercurrent multiplets (N >= k + 1 or a free sector): the sum over the flavor charges of the positive t^7 chi_{1/2} coefficients of the reduced index (C3 at j = 1/2); 0 unless the verdict is consistent"},
         "unlisted_positive_terms": {"anyOf": [{"$ref": "#/$defs/operator_list"}, {"type": "null"}], "description": "positive terms of the F-term-substituted scalar part at 0 < E < 6 that the inherited entry rule does not list as relevant (net coefficient zero at their own flavor)"},
         "negative_power_terms": {"anyOf": [{"$ref": "#/$defs/operator_list"}, {"type": "null"}], "description": "positive terms with a negative power of a field (a conjugate-fermion letter of a field outside the superpotential): kept out of every operator list"},
-        "flags": {"type": "object"}
+        "flags": {"type": "object", "description": "c4_vanishing; c1prime, c3_free, c3_enhance as [2j, multiplicity, charge] at every flavor charge where the condition holds; noninteger as [milli, 2j, coefficient, charge]"}
       }
     }
   }

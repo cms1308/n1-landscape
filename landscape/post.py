@@ -35,7 +35,7 @@ are not affected.
 `columns` are the fields of a theory; the argument `field_cols` exists for synthetic
 inputs whose flavor exponents are given as extra columns instead of through a basis.
 
-The native pass (step 43; singlet.NATIVE_POST): when the expansion is a
+The native pass (singlet.NATIVE_POST): when the expansion is a
 model.FieldResolvedExpansion -- its rows held by the extension -- `index`, `decouple` and
 `prefilter` take the reduced index, its flavor projection and the net index of `scan` from
 one call of FieldResolvedRows.reduce (`_reduced_native`) instead of the linear passes
@@ -53,7 +53,7 @@ from fractions import Fraction as F
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import mass
-from .model import FieldResolvedTerm
+from .model import FieldResolvedTerm, project
 
 Vec = Tuple[int, ...]
 Key = Tuple[int, int, Vec]              # (milli, ypow, exponent vector)
@@ -68,6 +68,11 @@ INDEX_VERDICTS = ("consistent", "inconsistent-index", "free-sector-higher-spin-c
 
 class PostProcessingError(RuntimeError):
     """A branch the old code leaves ill-defined (recorded, not mirrored)."""
+
+
+class FlavorRowsOverflow(PostProcessingError):
+    """A sum of the native pass beyond 128 bits over an expansion with flavor-refined rows, for which no Python path
+    exists: the caller asks for the expansion field-resolved throughout (record.build)."""
 
 
 def verdict_class(old: str) -> Optional[str]:
@@ -386,55 +391,68 @@ def _unlisted(fullscalar: Poly, wvars, w, cols, relevant: Dict[Vec, F]):
 # --------------------------------------------------------------------------- #
 # C1' / C3 / C4 on the net reduced index
 # --------------------------------------------------------------------------- #
-def scan(terms: Iterable[FieldResolvedTerm], t_order: int) -> dict:
-    """conditions.scan on the model: every bucket with E <= t_order is exact."""
+def scan(terms: Iterable[FieldResolvedTerm], t_order: int, basis: Sequence[Sequence[int]]) -> dict:
+    """conditions.scan on the model, per flavor charge of `basis`: every bucket with E <= t_order is exact."""
     terms = list(terms)
     refined: Poly = {}
-    base: Dict[Tuple[int, int], F] = {}
     for t in terms:
         _add(refined, (t.milli, t.ypow, tuple(t.markers)), F(t.coeff))
-        base[(t.milli, t.ypow)] = base.get((t.milli, t.ypow), 0) + F(t.coeff)
     if terms:
         _add(refined, (0, 0, (0,) * len(terms[0].markers)), F(-1))
-    base[(0, 0)] = base.get((0, 0), 0) - 1
-    net: Dict[Tuple[int, int], F] = {}
-    for (m, y), c in base.items():
+    return _scan_flags(bool(refined), _charge_net(project(terms, basis), len(basis)), t_order)
+
+
+def _charge_net(physical, rank: int) -> Dict[Tuple[int, int, Vec], F]:
+    """The reduced index per flavor charge, (milli, y, charge) -> coefficient: (1 - t^3 y)(1 - t^3/y)(I - 1) of the
+    physical index I (`model.project`), every term kept (the flags read E <= t_order only)."""
+    base: Dict[Tuple[int, int, Vec], F] = {}
+    for p in physical:
+        k = (p.milli, p.ypow, tuple(p.flavor))
+        base[k] = base.get(k, F(0)) + F(p.coeff)
+    zero = (0,) * rank
+    base[(0, 0, zero)] = base.get((0, 0, zero), F(0)) - 1
+    net: Dict[Tuple[int, int, Vec], F] = {}
+    for (m, y, q), c in base.items():
         if c:
             for dm, dy, s in _KERNEL:
-                net[(m + dm, y + dy)] = net.get((m + dm, y + dy), 0) + s * c
-    return _scan_flags(bool(refined), net, t_order)
+                k = (m + dm, y + dy, q)
+                net[k] = net.get(k, F(0)) + s * c
+    return net
 
 
-def _scan_flags(nonvanishing: bool, net: Dict[Tuple[int, int], F], t_order: int) -> dict:
-    """The flags of `scan` from the net reduced index (milli, y) -> coefficient (zero entries
-    optional) and whether the expansion minus 1 is nonempty."""
+def _scan_flags(nonvanishing: bool, net: Dict[Tuple[int, int, Vec], F], t_order: int) -> dict:
+    """The flags of `scan` from the reduced index per flavor charge (milli, y, charge) -> coefficient (zero
+    entries optional) and whether the expansion minus 1 is nonempty.  C1' and C3 are evaluated at every charge,
+    as C1/C2 are: a condition is raised at each charge where it holds, the entry (2j, multiplicity, charge)
+    (noninteger: (milli, 2j, coefficient, charge)); the summed index can hide a term that the charges cancel."""
     flags = {"c4_vanishing": not nonvanishing, "c1prime": [], "c3_free": [], "c3_enhance": [], "noninteger": []}
     if flags["c4_vanishing"]:
         return flags
     max_milli = 1000 * t_order
+    for q in sorted({k[2] for k in net}):
 
-    def chi(milli: int, j2: int):
-        n = net.get((milli, j2), 0) - net.get((milli, j2 + 2), 0)
-        return F(n) if n else None
+        def chi(milli: int, j2: int):
+            n = net.get((milli, j2, q), 0) - net.get((milli, j2 + 2, q), 0)
+            return F(n) if n else None
 
-    for j2 in range(1, (max_milli - 2000) // 1000 + 1):
-        n = chi(2000 + 1000 * j2, j2)
-        if n is None:
-            continue
-        if n.denominator != 1:
-            flags["noninteger"].append((2000 + 1000 * j2, j2, str(n)))
-        elif (n if j2 % 2 == 0 else -n) > 0:
-            flags["c1prime"].append((j2, int(n)))
-    for j2 in range(1, (max_milli - 6000) // 1000 + 1):
-        n = chi(6000 + 1000 * j2, j2)
-        if n is None:
-            continue
-        if n.denominator != 1:
-            flags["noninteger"].append((6000 + 1000 * j2, j2, str(n)))
-            continue
-        mult = -n if j2 % 2 == 0 else n
-        if mult > 0:
-            flags["c3_enhance" if j2 == 1 else "c3_free"].append((j2, int(mult)))
+        for j2 in range(1, (max_milli - 2000) // 1000 + 1):
+            n = chi(2000 + 1000 * j2, j2)
+            if n is None:
+                continue
+            if n.denominator != 1:
+                flags["noninteger"].append((2000 + 1000 * j2, j2, str(n), q))
+            elif (n if j2 % 2 == 0 else -n) > 0:
+                flags["c1prime"].append((j2, int(n), q))
+        for j2 in range(1, (max_milli - 6000) // 1000 + 1):
+            n = chi(6000 + 1000 * j2, j2)
+            if n is None:
+                continue
+            if n.denominator != 1:
+                flags["noninteger"].append((6000 + 1000 * j2, j2, str(n), q))
+                continue
+            mult = -n if j2 % 2 == 0 else n
+            if mult > 0:
+                flags["c3_enhance" if j2 == 1 else "c3_free"].append((j2, int(mult), q))
     return flags
 
 
@@ -451,7 +469,7 @@ class PostResult:
     marginal: Optional[List[dict]] = None
     dim3: Optional[int] = None
     nonmanifest_symmetry: Optional[bool] = None
-    susy_enhanced: bool = False
+    extra_supercurrents: int = 0             # sum over charges of the positive t^7 chi_{1/2} coefficients
     unlisted: Optional[List[dict]] = None    # positive substituted terms at 0 < E < 6 that the entry rule does not list
     negative: Optional[List[dict]] = None    # positive terms with a negative power, kept out of every list above
     flags: dict = field(default_factory=dict)
@@ -481,7 +499,7 @@ def _reduced_native(native, basis: Sequence[Sequence[int]], t_order: int):
                                                                   int(round(1000 * t_order)), 6000)
     except OverflowError as e:
         if native.n_flavor_rows:            # flavor-refined above t^6: no Python path exists for these rows
-            raise PostProcessingError(f"native post pass overflow on a flavor-refined expansion: {e}")
+            raise FlavorRowsOverflow(f"native post pass overflow on a flavor-refined expansion: {e}")
         return None
     return (vanishing, fullpower, {(m, y, v): F(c) for m, y, v, c in blocks},
             {(m, y, fl): F(c) for m, y, fl, c in index2}, {(m, y): F(c) for m, y, c in net})
@@ -500,8 +518,12 @@ def _setup(terms, basis, w, field_cols):
 
 def decouple(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w: Sequence[Dict[int, int]],
              t_order: int, field_cols: Optional[Sequence[int]] = None) -> PostResult:
-    """The low-order pass: operators at the lowest scalar exponent when it is <= 2
-    (R <= 2/3), after the F-term substitution."""
+    """The low-order pass: operators at the lowest scalar exponent <= 2 (R <= 2/3) whose block,
+    after the F-term substitution, holds a chiral operator (a positive entry without a negative
+    power of a field): a chiral operator of R <= 2/3 is decoupled before the charges judge a term
+    with fermion content below it.  The exponents are those of the flavor-refined scalar part --
+    an exponent present at some flavor charge, the entries of `index`: terms of different charges
+    are different operators and do not cancel."""
     terms, cols, w = _setup(terms, basis, w, field_cols)
     res = PostResult(decoupled=[])
     native = _native_of(terms)
@@ -519,20 +541,23 @@ def decouple(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]],
     if not index2:
         return res
     scalars = extract_scalar(reduced, fullpower if pre is not None else _y_max(reduced))
-    unrefined = extract_scalar(index2, _y_max(index2))
-    if not unrefined:
+    refined = extract_scalar(index2, _y_max(index2))
+    if not refined:
         res.relevant, res.flipped = [], []
         return res
-    exponents = sorted(m for m, _, _ in unrefine(unrefined) if 0 < m < 6000)
+    exponents = sorted({m for m, _, _ in refined if 0 < m < 6000})
     if not exponents:
         raise PostProcessingError("decouple: no scalar exponent in (0, 6)")
     letters = {k: c for e in set(exponents) for k, c in coefficient_t(scalars, e).items()}
     rules = fterm_rules(letters, cols, w)
-    if exponents[0] <= 2000:
-        block = apply_fterm(coefficient_t(scalars, exponents[0]), rules, w)
+    for e in (e for e in exponents if e <= 2000):
+        block = apply_fterm(coefficient_t(scalars, e), rules, w)
         chiral, negative = _split(_operators(block, cols))
-        res.decoupled = operator_list(chiral, cols)
-        res.negative = operator_list(negative, cols)
+        if chiral or e == exponents[0]:         # without a chiral operator, the lowest exponent's block
+            res.decoupled = operator_list(chiral, cols)
+            res.negative = operator_list(negative, cols)
+        if chiral:
+            break
     return res
 
 
@@ -583,11 +608,11 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
     native = _native_of(terms)
     pre = _reduced_native(native, basis, t_order) if native is not None else None
     if pre is not None:
-        vanishing, fullpower, reduced2, index2, net = pre
-        res.flags = _scan_flags(not vanishing, net, t_order)
+        vanishing, fullpower, reduced2, index2, _ = pre
+        res.flags = _scan_flags(not vanishing, _charge_net(project(terms, basis), len(basis)), t_order)
     else:
         terms = list(terms)
-        res.flags = scan(terms, t_order)
+        res.flags = scan(terms, t_order, basis)
     if res.flags["c4_vanishing"]:
         res.consistency = res.verdict = "vanishing-index"
         res.decoupled = []
@@ -654,7 +679,6 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
                     _merge(flipped, ops)
             marginal: Dict[Vec, F] = {}
             dim3 = 0
-            coef_total = F(0)
             if has_six:
                 six = by_m.get(6000, {})
                 coef = w_to_one(apply_fterm(six, fterm_rules(six, wvars, w), w), w)
@@ -663,7 +687,6 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
                     key = tuple(v[f] for f in cols)
                     by_fields[key] = by_fields.get(key, 0) + c
                 by_fields = {k: c for k, c in by_fields.items() if c}
-                coef_total = by_fields.get((0,) * len(cols), F(0))
                 if any(any(k) for k in by_fields):
                     for (_, _, v), c in coef.items():
                         key = tuple(v[f] for f in cols)
@@ -679,7 +702,13 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
             res.marginal = operator_list(marginal, cols)
             res.negative = operator_list(negative, cols)
             res.dim3 = dim3
-            res.nonmanifest_symmetry = bool(len(basis) + coef_total < 0)
+            # from the flavor-refined reduced index alone: at t^6 and y^0 of the scalar part,
+            # marginal operators minus conserved currents per charge; a negative coefficient at a charge q != 0 (a
+            # charged current no marginal operator cancels) or a neutral coefficient below minus the number of manifest
+            # U(1)s (more neutral currents than those) certifies a symmetry beyond the manifest U(1)s
+            six = {fl: c for (m, y, fl), c in indexscalar.items() if m == 6000 and y == 0 and c}
+            res.nonmanifest_symmetry = bool(len(basis) + six.get(neutral, 0) < 0
+                                            or any(c < 0 for fl, c in six.items() if fl != neutral))
 
     # 3. C1'/C3 routing (C3 with j >= 1 takes precedence over C1')
     res.verdict = res.consistency
@@ -688,6 +717,8 @@ def index(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]], w:
             res.verdict = "free-sector-higher-spin-current"
         elif res.flags["c1prime"]:
             res.verdict = "free-sector"
-        elif res.flags["c3_enhance"]:
-            res.susy_enhanced = True
+        else:
+            # at least this many extra supercurrent multiplets (N >= k + 1 or a free sector): a positive t^7 chi_{1/2}
+            # coefficient at a charge proves as many such multiplets of that charge
+            res.extra_supercurrents = sum(mult for _, mult, _ in res.flags["c3_enhance"])
     return res

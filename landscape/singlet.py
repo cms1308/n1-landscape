@@ -1,48 +1,37 @@
-"""FORM-output parser and gauge-singlet projection for a product of simple groups.
+"""Gauge-singlet projection of character products for a product of simple groups, and the call of the
+native expansion engine.
 
-The FORM program (form.py) writes one character function per
-(node, Dynkin label), named by `char_symbol`: `C0L1x0(k)` is psi^k of the C2
-representation [1,0] at node 0.  Fields with the same label at a node share the symbol,
-as the species symbols of the old program were shared (`q(k)` for every fundamental);
-a field in a product representation contributes the same Adams index k at every node
-it charges, because chi_{R_1 x R_2}(x^k) = psi^k(chi_{R_1}) psi^k(chi_{R_2}).
+`expand_series_native` hands a `form.Series` to the extension (`landscape_native.expand_series`): the
+irreducible mode -- one highest weight per node in place of the character slots of a monomial, a
+product with a letter decomposed at once by the Brauer-Klimyk rule, the rows the entries whose highest
+weights are all zero -- or, for the checks, the slot engine, which asks `ProductProjector.multiplicity`
+for a character product it cannot project itself.
 
-A parsed term carries, per node, the Adams multiplicity key of every label present;
-the singlet multiplicity of the term is the product over the nodes of the singlet
-multiplicity of that node's character product (the singlet of R_1 x ... x R_k of a
-product group is the product of the per-node singlets).  One label is one store
-lookup.  Several labels are split into two parts at label granularity, balanced by
-the product of the term counts of their stored decompositions; each part is
-decomposed through the node's own tensor-step cache (one label needs no LiE call, a
-part of several labels a chain of tensor steps starting from its first decomposition),
-and the two parts are contracted by the pairing of dual representations, sum over
-lambda of a_lambda b_{lambda*} with lambda* the conjugate highest weight -- the
-singlet multiplicity of the product of two virtual characters, so the complete
-product is never tensor-decomposed (scheme "split", the default).  The left-to-right
-chain through the complete product (scheme "chain") is kept as the comparison
-baseline.  The old species-keyed FORM outputs are read back through
-`chars_from_species` (species merged into their label) for the single-node
-regressions.
-
-Exact semantics inherited from the original code: the t-exponent decoding
-t^{d0} s^{d1} r^{d2} -> d0/500 + d1/2.5e6 + d2/1.25e10 quantized to 0.001 (ROUND_HALF_UP);
-Adams key entry k-1 = multiplicity of Adams_k, zero-padded to total degree; the
-singlet of a single decomposition read from the first term of a LiE character string;
-the LiE tensor invocation, [53:] banner slice, 'line'-triggered maxobjects retry and
-the validity gate before caching.
+A character product carries, per node, the Adams multiplicity key of every label present; its singlet
+multiplicity is the product over the nodes of the singlet multiplicity of that node's character product
+(the singlet of R_1 x ... x R_k of a product group is the product of the per-node singlets).  One label is
+one store lookup.  Several labels are split into two parts at label granularity, balanced by the product
+of the term counts of their stored decompositions; each part is decomposed through the node's own
+tensor-step cache (one label needs no tensor step, a part of several labels a chain of tensor steps
+starting from its first decomposition), and the two parts are contracted by the pairing of dual
+representations, sum over lambda of a_lambda b_{lambda*} with lambda* the conjugate highest weight -- the
+singlet multiplicity of the product of two virtual characters, so the complete product is never
+tensor-decomposed (scheme "split", the default).  The left-to-right chain through the complete product
+(scheme "chain") is kept as the comparison baseline.  The tensor steps run in the native character engine
+(`store.run_lie`, LiE's output format), with the inherited [53:] banner slice, 'line'-triggered maxobjects
+retry and validity gate before caching.
 """
 from __future__ import annotations
 
 import functools
+import math
 import os
-import re
 import subprocess
 import threading
 import time
-from decimal import Decimal, ROUND_HALF_UP, localcontext
-from fractions import Fraction
-from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
+
+import landscape_native as _native
 
 from . import lie
 from .store import LabelStore, run_lie, singlet_coefficient, label_key
@@ -52,183 +41,76 @@ KeyVec = Tuple[int, ...]
 NodeChars = Tuple[Tuple[Label, KeyVec], ...]      # sorted by label
 Chars = Tuple[NodeChars, ...]                     # one entry per node
 
-_SYMBOL_RE = re.compile(r"^C(\d+)L(\d+(?:x\d+)*)$")
-_MILLI_Q = Decimal("0.001")
-
-
-def char_symbol(node: int, label: Sequence[int]) -> str:
-    """FORM function name of psi^k(chi_label) at a node: C<node>L<l1>x<l2>x..."""
-    return f"C{node}L" + "x".join(str(int(x)) for x in label)
-
-
-def parse_symbol(name: str) -> Optional[Tuple[int, Label]]:
-    m = _SYMBOL_RE.match(name)
-    if not m:
-        return None
-    return int(m.group(1)), tuple(int(x) for x in m.group(2).split("x"))
-
-
-def key_vec_of(adams: Dict[int, int]) -> KeyVec:
-    """{k: m_k} -> [m_1, ..., m_N] with N = sum k m_k."""
-    adams = {k: m for k, m in adams.items() if m}
-    if not adams:
-        return ()
-    length = sum(k * m for k, m in adams.items())
-    vec = [0] * length
-    for k, m in adams.items():
-        vec[k - 1] = m
-    return tuple(vec)
-
-
-def adams_of(key_vec: Sequence[int]) -> Dict[int, int]:
-    return {k + 1: m for k, m in enumerate(key_vec) if m}
-
-
-def node_chars(per_label: Dict[Label, Dict[int, int]]) -> NodeChars:
-    return tuple(sorted((lab, key_vec_of(ad)) for lab, ad in per_label.items() if any(ad.values())))
-
-
-class Term(NamedTuple):
-    """One '+'-separated FORM output term, exactly decoded."""
-    coeff: Fraction
-    milli: int                              # physical t-exponent * 1000 (rounded)
-    ypow: int
-    fug: Tuple[Tuple[str, int], ...]        # sorted ((symbol, exponent), ...): field markers, flavor fugacities
-    chars: Chars
-
-
-def _milli_exponent(tpow: int, spow: int, rpow: int) -> int:
-    with localcontext() as ctx:
-        ctx.prec = 50
-        p = (Decimal(tpow) / Decimal(500) + Decimal(spow) / Decimal(2500000)
-             + Decimal(rpow) / Decimal(12500000000))
-        return int(p.quantize(_MILLI_Q, rounding=ROUND_HALF_UP) * 1000)
-
-
-def parse_term(term: str, n_nodes: int) -> Term:
-    """Parse one FORM output term (no spaces, '*'-separated factors)."""
-    coeff = Fraction(1)
-    tpow = spow = rpow = ypow = 0
-    fug: Dict[str, int] = {}
-    per_node: List[Dict[Label, Dict[int, int]]] = [dict() for _ in range(n_nodes)]
-    for factor in term.split("*"):
-        if factor.startswith("d(") and factor.endswith(")"):
-            n_str, m_str = factor[2:-1].split(",")
-            coeff *= Fraction(int(n_str), int(m_str))
-            continue
-        base, caret, exp_str = factor.partition("^")
-        exp = int(exp_str.strip("()")) if caret else 1
-        if "(" in base:
-            name, _, arg = base[:-1].partition("(")
-            sym = parse_symbol(name)
-            if sym is None:
-                raise ValueError(f"unknown character function {factor!r}")
-            node, label = sym
-            if node >= n_nodes:
-                raise ValueError(f"node {node} of {factor!r} beyond {n_nodes} nodes")
-            per = per_node[node].setdefault(label, {})
-            per[int(arg)] = per.get(int(arg), 0) + exp
-        elif base == "t":
-            tpow += exp
-        elif base == "s":
-            spow += exp
-        elif base == "r":
-            rpow += exp
-        elif base == "y":
-            ypow += exp
-        elif base.isdigit() or (base.startswith("-") and base[1:].isdigit()):
-            coeff *= Fraction(int(base)) ** exp
-        elif base:
-            fug[base] = fug.get(base, 0) + exp
-        else:
-            raise ValueError(f"empty factor in term {term!r}")
-    return Term(coeff=coeff, milli=_milli_exponent(tpow, spow, rpow), ypow=ypow,
-                fug=tuple(sorted((k, v) for k, v in fug.items() if v != 0)),
-                chars=tuple(node_chars(p) for p in per_node))
-
-
-try:                                            # the optional native extension (landscape_native, Rust)
-    import landscape_native as _native
-except ImportError:                             # the pure-Python path
-    _native = None
 
 def _switch(var: str, default: str = "1") -> bool:
     return os.environ.get(var, default).strip().lower() not in ("0", "off", "no", "")
 
 
-# The native parser is used when the extension imports and LANDSCAPE_NATIVE is not 0/off/no;
-# the combined native pass (parse, singlet lookups and the field-resolved aggregation in one
-# call) when in addition LANDSCAPE_NATIVE_EXPAND is not off.  Both attributes can be set at
-# runtime (the interleaved comparisons of the paths).
-NATIVE = _native is not None and _switch("LANDSCAPE_NATIVE")
-NATIVE_EXPAND = NATIVE and hasattr(_native, "expand") and _switch("LANDSCAPE_NATIVE_EXPAND")
-# The native expansion engine in place of FORM (LANDSCAPE_NATIVE_FORM; on by default since its
-# gate passed: the polynomial equal to FORM's on the replay set, the corpus and the sample, the
-# expansion stages 5.4x faster): the exponential of the explicit itotal computed by the
-# extension, FORM the reference and the fallback (an overflow of the 128-bit coefficients, a
-# missing extension or the switch off run FORM as before).
-NATIVE_FORM = NATIVE and hasattr(_native, "expand_series") and _switch("LANDSCAPE_NATIVE_FORM")
-# The native post-processing pass (LANDSCAPE_NATIVE_POST; on by default when the extension provides
-# FieldResolvedRows): the engine and the combined pass keep their rows in the extension, and
-# post.index / post.decouple / post.prefilter and model.project read the reduced index, its flavor
-# projection, the net index and the physical index from one native pass over them; the Python
+# The native post-processing pass (LANDSCAPE_NATIVE_POST, on by default): the engine keeps its rows in the
+# extension, and post.index / post.decouple / post.prefilter and model.project read the reduced index, its
+# flavor projection, the net index and the physical index from one native pass over them; the Python
 # functions are the reference and the fallback (a plain list of FieldResolvedTerms, or an overflow).
-NATIVE_POST = NATIVE and hasattr(_native, "FieldResolvedRows") and _switch("LANDSCAPE_NATIVE_POST")
-# The refinements of the expansion engine (step 44), each gated separately and on by default only
-# where adopted: the flavor projection above t^6 (LANDSCAPE_NATIVE_FLAVOR, adopted -- on by default;
-# the rows above t^6 are then flavor-refined, which only the native post pass consumes, so it needs
-# NATIVE_POST), the 64-bit coefficient path (LANDSCAPE_NATIVE_COEF64, declined: 4.5 % on the engine
-# stage, off by default) and the exact-milli truncation (LANDSCAPE_NATIVE_EXACT, declined: no gain, off
-# by default).
-NATIVE_FLAVOR = NATIVE_POST and NATIVE_FORM and _switch("LANDSCAPE_NATIVE_FLAVOR")
-NATIVE_COEF64 = NATIVE_FORM and _switch("LANDSCAPE_NATIVE_COEF64", "0")
-NATIVE_EXACT = NATIVE_FORM and _switch("LANDSCAPE_NATIVE_EXACT", "0")
-
-
-def native_available() -> bool:
-    return _native is not None
-
-
-def native_expand_available() -> bool:
-    return _native is not None and hasattr(_native, "expand")
-
-
-def native_form_available() -> bool:
-    return _native is not None and hasattr(_native, "expand_series")
-
-
-def native_post_available() -> bool:
-    return _native is not None and hasattr(_native, "FieldResolvedRows")
+NATIVE_POST = _switch("LANDSCAPE_NATIVE_POST")
+# The flavor projection above t^6 (LANDSCAPE_NATIVE_FLAVOR, on by default): the rows above t^6 are
+# flavor-refined, which only the native post pass consumes, so it needs NATIVE_POST.  The 64-bit coefficient
+# path (LANDSCAPE_NATIVE_COEF64) and the exact-milli truncation (LANDSCAPE_NATIVE_EXACT): off by default.
+NATIVE_FLAVOR = NATIVE_POST and _switch("LANDSCAPE_NATIVE_FLAVOR")
+NATIVE_COEF64 = _switch("LANDSCAPE_NATIVE_COEF64", "0")
+NATIVE_EXACT = _switch("LANDSCAPE_NATIVE_EXACT", "0")
+# The full-order expansion computed flavor-refined throughout and spliced with the order-6 expansion's
+# rows through t^6, the same terms (on by default; LANDSCAPE_NATIVE_SPLICE=0 computes the full expansion).
+NATIVE_SPLICE = NATIVE_FLAVOR and _switch("LANDSCAPE_NATIVE_SPLICE")
 
 
 class NativeOverflow(ArithmeticError):
-    """The series engine's 128-bit coefficients overflowed; the caller falls back to FORM."""
+    """A flavor-refined row of the expansion beyond 128 bits; the caller asks for the expansion field-resolved, whose rows
+    then come with arbitrary-precision coefficients."""
 
 
 class NativeCapacity(NativeOverflow):
-    """The series engine's expansion exceeds its monomial cap (LANDSCAPE_NATIVE_MAX_TERMS, default
-    8,000,000 per power and in total: a theory of 25 fields at expansion order 38 reached 10 M
-    monomials at k = 5 and 20 GB at k = 6); the caller falls back to FORM, which sorts on disk."""
+    """The slot engine's expansion exceeds its monomial cap (LANDSCAPE_NATIVE_MAX_TERMS, default 8,000,000 per power;
+    engine="slot" only -- the irreducible mode spills a power beyond its budget to disk)."""
+
+
+class WorkBound(RuntimeError):
+    """The expansion was cut by its work bound: the product terms the irreducible mode formed exceeded `work_bound`
+    (`terms`, the count at the cut)."""
+
+    def __init__(self, terms: int):
+        super().__init__(f"work-bound: {terms} product terms formed")
+        self.terms = terms
+
+
+def last_work() -> int:
+    """The product terms the last expansion of the irreducible mode in this process formed (up to the cut)."""
+    return int(_native.last_work())
 
 
 def expand_series_native(series, projector: "ProductProjector", timeout: Optional[float] = None,
                          budget_s: Optional[float] = None, monomials: bool = False, native_rows: bool = False,
-                         basis=None, exact: bool = False, coef64: bool = False):
-    """The native expansion of a `form.Series`: the rows of the field-resolved expansion
-    (as expand_native; a FieldResolvedRows object when native_rows is set -- with `basis`, the
-    rows above t^6 flavor-refined by it, the object only), or with monomials=True the
-    polynomial itself [(numerator, denominator, exponents)] for the comparison with FORM's
-    output.  `exact` and `coef64` are the engine refinements of step 44.  The singlet
-    multiplicities are computed in the extension from the stores' groups, `projector.multiplicity`
-    its fallback (and, with LANDSCAPE_NATIVE_VERIFY_MULT=1, the check of every value).
-    NativeOverflow on an overflow; subprocess.TimeoutExpired past the timeout."""
+                         basis=None, exact: bool = False, coef64: bool = False, flavor_only: bool = False,
+                         engine: str = "irrep", work_bound: Optional[int] = None):
+    """The native expansion of a `form.Series`: the rows of the field-resolved expansion, a list of (numerator,
+    denominator, milli, y, markers) or a FieldResolvedRows object when native_rows is set (with `basis`, the rows above
+    t^6 flavor-refined by it, the object only).  `engine`: "irrep", the irreducible mode (the package's engine), or
+    "slot", the slot engine -- the checks' reference, which with monomials=True gives the polynomial itself
+    [(numerator, denominator, exponents)] and asks `projector.multiplicity` where the extension cannot project a
+    character product.  `exact` and `coef64` are refinements of the engine, off by default.  A row beyond 128 bits of a
+    field-resolved expansion comes in the list with arbitrary-precision coefficients; NativeOverflow when a row beyond
+    128 bits is flavor-refined (the caller asks for the expansion field-resolved), NativeCapacity at the slot engine's
+    cap; subprocess.TimeoutExpired past the timeout; WorkBound when the irreducible mode forms more than `work_bound`
+    product terms."""
     try:
         return _native.expand_series(series.terms, series.t_limit, series.max_order, series.n_fields,
                                      [(node, list(label), k) for node, label, k in series.slots], series.n_nodes,
-                                     series.t_order, lambda chars: projector.multiplicity(chars, budget_s), timeout, monomials,
+                                     math.ceil(series.t_order), lambda chars: projector.multiplicity(chars, budget_s), timeout, monomials,
                                      native_rows, basis, exact, coef64,
-                                     [(s.lie_group, s.type, s.rank) for s in projector._stores])
+                                     [(s.lie_group, s.type, s.rank) for s in projector._stores],
+                                     flavor_only=flavor_only, engine=engine, work_bound=work_bound,
+                                     milli_limit=None if series.t_order == int(series.t_order) else int(1000 * series.t_order))
     except ValueError as e:
+        if str(e).startswith("work-bound: "):
+            raise WorkBound(int(str(e).split()[1])) from e
         if str(e).startswith("capacity"):
             raise NativeCapacity(str(e)) from e
         if "overflow" in str(e):
@@ -236,56 +118,11 @@ def expand_series_native(series, projector: "ProductProjector", timeout: Optiona
         raise
 
 
-def expand_native(text: str, n_nodes: int, n_fields: int, t_order: int, projector: "ProductProjector",
-                  budget_s: Optional[float] = None, native_rows: bool = False):
-    """The combined native pass: [(numerator, denominator, milli, ypow, markers)] of the
-    field-resolved expansion through t^t_order (a FieldResolvedRows object when native_rows is
-    set), the singlet multiplicity of every distinct character product from
-    `projector.multiplicity` (its memo, the stores and LiE as usual; products occurring only in
-    terms above the truncation are not looked up)."""
-    return _native.expand(text, n_nodes, n_fields, t_order, lambda chars: projector.multiplicity(chars, budget_s), native_rows)
-
-
-def parse_terms(text: str, n_nodes: int) -> List[Term]:
-    """Every '+'-separated term of a FORM output, parsed: the native parser when the
-    extension is importable and NATIVE is set, `parse_term` term by term otherwise; the
-    same Term objects (coefficient a Fraction, the tuples as parse_term builds them) either
-    way."""
-    if NATIVE and _native is not None:
-        try:
-            return _native.parse_terms(text, n_nodes, Term, Fraction)
-        except ValueError as e:
-            if "overflow" not in str(e):
-                raise
-            # a coefficient beyond 128 bits (expansion orders above about 20; found on the
-            # June-2026 Sp2nf5 landscape at order 25): the Python parser, arbitrary precision
-    return [parse_term(t, n_nodes) for t in text.split("+") if t]
-
-
-def parse_form_file(path: Path, n_nodes: int) -> List[Term]:
-    return parse_terms(Path(path).read_text(), n_nodes)
-
-
-def chars_from_species(old_chars: Sequence[Tuple[str, Sequence[int]]], n_nodes: int, node: int,
-                       label_of: Dict[str, Sequence[int]]) -> Chars:
-    """Old single-group chars ((species, key_vec), ...) -> product chars with the species
-    merged into their Dynkin label at `node` (Adams multiplicities added)."""
-    per: Dict[Label, Dict[int, int]] = {}
-    for species, kv in old_chars:
-        lab = tuple(int(x) for x in label_of[species])
-        ad = per.setdefault(lab, {})
-        for k, m in adams_of(kv).items():
-            ad[k] = ad.get(k, 0) + m
-    out: List[NodeChars] = [() for _ in range(n_nodes)]
-    out[node] = node_chars(per)
-    return tuple(out)
-
-
 SCHEMES = ("split", "chain")
 
 
 class ProductProjector:
-    """Gauge-singlet projection of parsed terms for a product of simple groups: one
+    """Gauge-singlet projection of character products for a product of simple groups: one
     LabelStore per node (character decompositions and tensor-step cache), the singlet
     multiplicity = product over nodes; per node the balanced split and the pairing of
     dual representations (scheme "split"), or the chain through the complete product
@@ -340,7 +177,7 @@ class ProductProjector:
                 out = self._lie_runner(lcode, min(self._lie_timeout, remaining))[53:].strip()
                 out = out.replace("\n", "").replace(" ", "")
             except subprocess.TimeoutExpired:
-                raise self._timeout_error("lie subprocess timeout", self._lie_timeout)
+                raise self._timeout_error("character engine timeout", self._lie_timeout)
             if "line" not in out:
                 break
         if out and "X" in out and "line" not in out:
@@ -438,21 +275,3 @@ class ProductProjector:
         with self._lock:
             self._sig_memo[chars] = result
         return result
-
-
-def project_terms(terms: Sequence[Term], projector: ProductProjector, core: int = 1,
-                  match_timeout: Optional[float] = None) -> List[Tuple[Term, int]]:
-    """(term, singlet multiplicity) for every parsed term; chains on a thread pool."""
-    unique = {t.chars for t in terms if any(t.chars)}
-    multi = [c for c in unique if any(len(ci) >= 2 for ci in c)]
-    if multi and core > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=core) as pool:
-            for fut in [pool.submit(projector.multiplicity, c, match_timeout) for c in multi]:
-                fut.result()
-    return [(t, projector.multiplicity(t.chars, match_timeout)) for t in terms]
-
-
-def process_form_output(form_path: Path, projector: ProductProjector, core: int = 1,
-                        match_timeout: Optional[float] = None) -> List[Tuple[Term, int]]:
-    return project_terms(parse_form_file(form_path, projector.n_nodes), projector, core, match_timeout)

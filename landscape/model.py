@@ -10,7 +10,7 @@ Provided here:
   * the flavor lattice: the saturated integer kernel of the anomaly and neutrality
     constraints, in Hermite normal form (rows = U(1) generators, columns = fields in
     the order given);
-  * the singlet multiplicity of a superpotential monomial (LiE, product group) and the
+  * the singlet multiplicity of a superpotential monomial (product group) and the
     ambiguity flag (multiplicity > 1: the exponent vector does not name the contraction);
   * the canonical form under permutations of identical nodes, permutations of fields
     and conjugation of a node, with the maps from source positions, and its hash;
@@ -290,35 +290,33 @@ def flavor_rank(th: Theory) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# singlet multiplicity of a superpotential monomial (LiE, product group)
+# singlet multiplicity of a superpotential monomial (product group)
 # --------------------------------------------------------------------------- #
 _SINGLET_CACHE: Dict[tuple, int] = {}
 
 
-def singlet_multiplicity(th: Theory, term: Term) -> int:
-    """Number of gauge singlets in the tensor product over the fields of the symmetric
-    powers Sym^{p}(R_f) of the product-group representations of the term."""
+def singlet_key(th: Theory, term: Term):
+    """The key of a term's singlet count: the involved nodes (type, rank) and, sorted, every field charged under
+    them with its labels on those nodes and its power; None when no node is involved."""
     involved = [(i, node) for i, node in enumerate(th.nodes)
                 if any(any(th.fields[f][i]) for f in term)]
     if not involved:
+        return None
+    return (tuple((node.type, node.rank) for _, node in involved),
+            tuple(sorted((tuple(th.fields[f][i] for i, _ in involved), p) for f, p in term.items()
+                         if any(any(th.fields[f][i]) for i, _ in involved))))
+
+
+def singlet_multiplicity(th: Theory, term: Term) -> int:
+    """Number of gauge singlets in the tensor product over the fields of the symmetric
+    powers Sym^{p}(R_f) of the product-group representations of the term: the native extension
+    (Newton's formula over its projector)."""
+    key = singlet_key(th, term)
+    if key is None:
         return 1
-    key = (tuple((node.type, node.rank) for _, node in involved),
-           tuple(sorted((tuple(th.fields[f][i] for i, _ in involved), p) for f, p in term.items()
-                        if any(any(th.fields[f][i]) for i, _ in involved))))
     if key in _SINGLET_CACHE:
         return _SINGLET_CACHE[key]
-    group = lie.lie_group([node.key() for _, node in involved])
-    rank = sum(node.rank for _, node in involved)
-    factors = []
-    for labs, p in key[1]:
-        lab = lie.lie_label(labs)
-        factors.append(f"sym_tensor({p},{lab},{group})" if p > 1 else f"1X{lab}")
-    acc = factors[0]
-    for fct in factors[1:]:
-        acc = f"tensor({acc},{fct},{group})"
-    (val,) = lie.lie_values([acc], group)
-    poly = lie.parse_poly(val)
-    mult = poly.get(tuple(0 for _ in range(rank)), 0)
+    mult = lie.native_sym_singlet(key[0], key[1])
     _SINGLET_CACHE[key] = mult
     return mult
 
@@ -515,19 +513,22 @@ def project(terms: Iterable[FieldResolvedTerm], basis: Sequence[Sequence[int]]) 
     """Physical index from the field-resolved expansion: flavor_a = sum_f B[a][f] n_f;
     terms with equal (t, y, flavor) merge — the markers are what keeps colliding
     charges apart before this projection.  On a FieldResolvedExpansion the sums are those of
-    the native pass (sorted as below; an overflow of its 128-bit integers falls back to the
-    Python loop on the same terms)."""
+    the native pass (sorted as below); an overflow of its 128-bit integers falls back to the
+    Python loop on the same terms, the flavor-refined rows above t^6 (`flavor_rows`, already in
+    this basis) added to the projection of the field-resolved ones."""
     native = getattr(terms, "native", None)
+    acc: Dict[tuple, F] = {}
     if native is not None:
         try:
             rows = native.project([list(map(int, row)) for row in basis])
+            return [PhysicalTerm(F(c), m, y, fl) for m, y, fl, c in rows]
         except OverflowError:
             if native.n_flavor_rows:
-                raise
-            rows = None
-        if rows is not None:
-            return [PhysicalTerm(F(c), m, y, fl) for m, y, fl, c in rows]
-    acc: Dict[tuple, F] = {}
+                assert [list(r) for r in native.basis()] == [list(map(int, r)) for r in basis], "flavor rows of another basis"
+                for c, m, y, fl in native.flavor_rows():
+                    key = (m, y, tuple(fl))
+                    acc[key] = acc.get(key, F(0)) + c
+                terms = [FieldResolvedTerm(F(c), m, y, mk) for c, _, m, y, mk in native.field_resolved_rows()]
     for t in terms:
         fl = tuple(sum(b * nf for b, nf in zip(row, t.markers)) for row in basis)
         key = (t.milli, t.ypow, fl)

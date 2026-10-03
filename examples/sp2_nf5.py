@@ -1,8 +1,8 @@
 """One theory through the pipeline: Sp(2) with ten fundamentals and W = 0.
 
 Expected: verdict `consistent`, R = 2/5 for every fundamental, a = 339/200, c = 257/100.
-Needs `form` and `lie` on PATH.  The character store is created under ./stores on the
-first run (a few minutes of LiE at t_order 9); later runs read it.
+Needs the native extension (`pip install ./native`).  The character store is created under
+./stores on the first run and filled by the extension's character engine; later runs read it.
 
     python examples/sp2_nf5.py [--t-order 9]
 """
@@ -23,7 +23,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--t-order", type=int, default=9, help="truncation order of the index (t^t_order)")
     ap.add_argument("--stores", default="stores", help="directory of the character stores")
-    ap.add_argument("--work", default="work", help="FORM work directory")
     args = ap.parse_args()
 
     th = Theory(nodes=[Node("C", 2)],
@@ -37,9 +36,8 @@ def main():
 
     t0 = time.time()
     Path(args.stores).mkdir(parents=True, exist_ok=True)
-    Path(args.work).mkdir(parents=True, exist_ok=True)
     stores = index.open_stores(th, args.stores)
-    engine = index.IndexEngine(stores, workdir=args.work)
+    engine = index.IndexEngine(stores)
     rec = record.build(th, engine, t_order=args.t_order)
     print(f"record in {time.time() - t0:.1f} s")
     print("verdict:", rec["verdict"])

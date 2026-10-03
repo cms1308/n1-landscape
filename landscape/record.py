@@ -3,7 +3,9 @@ post-processing (post.py) to a record of the schema `schema/record.schema.json`,
 as JSON lines.
 
 The per-theory sequence follows the original landscape code: charges -> expansion at the
-low order -> operators at R <= 2/3 -> when there are any, one of them is flipped (a
+low order (for a theory whose expansion order at t^3 exceeds form.LOW_TRUNCATION_ORDER, first
+the lower truncations form.LOW_TRUNCATIONS, each deciding a flip only; a term below a
+truncation is complete there) -> operators at R <= 2/3 -> when there are any, one of them is flipped (a
 trivial field X with the term X.O added, the flip recorded in `theory.flips`) and the
 sequence restarts -> otherwise the early-rejection stage (`prefilter`: post.prefilter, the
 C1/C2 conditions on the exact part of a low-order expansion -- the decoupling pass's order-3
@@ -12,10 +14,15 @@ full-order pass, so the theory is recorded inconsistent-index from that order, p
 that order giving its index, identity and analysis, `index.t_order` that order and
 `provenance.prefilter_order` recording it, and the full-order expansion is skipped; a hit whose
 post.index raises or does not return inconsistent-index falls back to the full order,
-`provenance.prefilter_fallback` recording why; a low-order expansion that is not returned
-leaves the decision to the full order, so the stage never causes index-not-computed) ->
+`provenance.prefilter_fallback` recording why; a low-order expansion past the deadline leaves the
+decision to the full order; a low-order expansion cut by the work bound ends the build
+index-not-computed, the full order forming every product term the lower one forms) ->
 otherwise the expansion at the full order
-(no descent to a lower order when it is not returned) -> conditions and operators.  The
+(no descent to a lower order when it is not returned) -> conditions and operators.  A theory
+whose full-order expansion stops (an order above form.MAX_ORDER, or a remaining field whose letter
+falls at t^0 on the grid) takes the C1/C2 test on the decoupling pass's order-3 expansion (already
+computed) and is otherwise recorded index-not-computed, without the order-6 expansion: it can be
+neither consistent nor expanded to the next level.  The
 operator flipped is the first entry of the decoupled list (sorted by monomial).
 
 Verdicts: those of amax.VERDICTS, those of post.INDEX_VERDICTS, and
@@ -23,8 +30,14 @@ Verdicts: those of amax.VERDICTS, those of post.INDEX_VERDICTS, and
                                                          index verdict)
   post-processing-error a branch the inherited post-processing leaves ill-defined; the
                         message is in provenance
-  index-not-computed    no expansion is returned at the low order or at the requested order
-                        (form.MAX_ORDER exceeded or a timeout).
+  index-not-computed    no expansion is returned at the low order or at the requested order;
+                        provenance.not_computed = {"cause", "order"}: "expansion-order" (an order
+                        above form.MAX_ORDER, or a remaining field whose letter falls at t^0 on the
+                        1/1000 grid -- an R-charge too close to 0 or 2), "work-bound" (the engine formed more than
+                        form.WORK_BOUND product terms; "bound" that bound -- not the count at the cut, which
+                        depends on the engine's threads) or "deadline"
+                        (the expansion past form.EXPANSION_TIMEOUT_S, a safety net), and the order
+                        of that expansion (a fraction for a lower truncation).
 A theory with an ambiguous superpotential term (singlet multiplicity above one) is written
 with `canonical.hash = null` and its ambiguous terms listed.
 
@@ -43,10 +56,10 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import mpmath as mp
 
-from . import amax, post
+from . import amax, form, post, singlet
 from .model import Theory, ambiguous_terms, canonical_form, identity_of_fixed_point, make_record, project
 
-RECORD_VERSION = "35.0"
+RECORD_VERSION = "36.0"
 SCHEMA_DIR = Path(__file__).resolve().parent / "schema"
 MAX_FLIPS = 32
 
@@ -110,26 +123,55 @@ def build(th: Theory, engine, t_order: int = 9, low_order: int = 3, provenance: 
         if res.verdict != "consistent":
             return rec(res.verdict)
         charges = res.charges_json()["R"]
-        low = engine.expansion(th, charges, low_order, basis=basis)
-        if low is None:
+
+        def not_computed(k, cause=None):
+            # the cause the engine gives (index.IndexEngine.stop); without it, an expansion the series stops never reached
+            # the engine and any other was past its deadline
+            stop = dict(getattr(engine, "stop", None) or {}) if cause is None else {"cause": cause}
+            if not stop.get("cause"):
+                stop["cause"] = "expansion-order" if form.expansion_stops(th, charges, k) else "deadline"
+            stop.pop("terms", None)                 # the count at a work-bound cut depends on the threads; the bound is kept
+            prov_here["not_computed"] = {"order": k, **stop}
             return rec("index-not-computed")
-        try:
-            dec = post.decouple(low, basis, th.terms, low_order)
-        except post.PostProcessingError as e:
-            prov_here["post_processing_error"] = str(e)
-            return rec("post-processing-error")
+        dec = None
+        for k in form.low_truncations(th, charges):     # the decoupling pass on lower truncations first: a flip only
+            low_k = engine.expansion(th, charges, k, basis=basis)
+            if low_k is None:
+                return not_computed(float(k))           # the low-order expansion forms every product term of this one
+            try:
+                dec_k = post.decouple(low_k, basis, th.terms, k)
+            except post.PostProcessingError:
+                continue
+            if dec_k.decoupled:
+                dec = dec_k
+                break
+        if dec is None:
+            low = engine.expansion(th, charges, low_order, basis=basis)
+            if low is None:
+                return not_computed(low_order)
+            try:
+                dec = post.decouple(low, basis, th.terms, low_order)
+            except post.PostProcessingError as e:
+                prov_here["post_processing_error"] = str(e)
+                return rec("post-processing-error")
         if dec.decoupled:
             op = {f: p for f, p in dec.decoupled[0]["monomial"]}
             flipped_ops = flipped_ops + [{"operator": dec.decoupled[0]["monomial"], "field": th.n_fields()}]
             th = flip(th, op)
             continue
+        stops = form.expansion_stops(th, charges, t_order)   # neither consistent nor expanded further: the order-3 test only
         order, terms, out = t_order, None, None     # no descent to lower orders
+        below = None                                # the order-6 expansion, for the splice (singlet.NATIVE_SPLICE)
         for k in (prefilter or ()):                 # early rejection on the exact part of a low order
-            if not low_order <= k < t_order:
+            if not low_order <= k < t_order or (stops and k != low_order):
                 continue
             low_k = low if k == low_order else engine.expansion(th, charges, k, basis=basis)
             if low_k is None:
-                break                               # not returned (a stop, or a timeout under load): the full order decides
+                if (getattr(engine, "stop", None) or {}).get("cause") == "work-bound":
+                    return not_computed(k)          # the full order forms every product term of this one
+                break                               # past the deadline: the full order decides
+            if k == 6:
+                below = low_k
             if not post.prefilter(low_k, basis, k):
                 continue
             try:
@@ -143,18 +185,29 @@ def build(th: Theory, engine, t_order: int = 9, low_order: int = 3, provenance: 
             order, terms, out = k, low_k, out_k
             prov_here["prefilter_order"] = k
             break
+        if terms is None and stops:
+            return not_computed(t_order, "expansion-order")
         if terms is None:
-            terms = engine.expansion(th, charges, order, basis=basis)
+            splice = {"below": below} if (below is not None and singlet.NATIVE_SPLICE) else {}
+            terms = engine.expansion(th, charges, order, basis=basis, **splice)
             if terms is None:
-                return rec("index-not-computed")
+                return not_computed(order)
             try:
-                out = post.index(terms, basis, th.terms, order)
+                try:
+                    out = post.index(terms, basis, th.terms, order)
+                except post.FlavorRowsOverflow:
+                    # a sum beyond 128 bits over the flavor-refined rows: the expansion field-resolved throughout,
+                    # which the Python functions read in exact arithmetic
+                    terms = engine.expansion(th, charges, order)
+                    if terms is None:
+                        return not_computed(order)
+                    out = post.index(terms, basis, th.terms, order)
             except post.PostProcessingError as e:
                 prov_here["post_processing_error"] = str(e)
                 return rec("post-processing-error", terms, order)
         verdict = _ratio_verdict(res.a, res.c) or out.verdict
         analysis = {"consistency": out.consistency, "dim3": out.dim3, "nonmanifest_symmetry": out.nonmanifest_symmetry,
-                    "susy_enhanced": out.susy_enhanced, "unlisted_positive_terms": out.unlisted,
+                    "extra_supercurrents": out.extra_supercurrents, "unlisted_positive_terms": out.unlisted,
                     "negative_power_terms": out.negative,
                     "flags": {k: (v if isinstance(v, bool) else [list(x) for x in v]) for k, v in out.flags.items()}}
         return rec(verdict, terms, order, out.operators(), analysis)

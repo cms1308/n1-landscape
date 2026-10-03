@@ -8,11 +8,12 @@ LiE's convention, so that the pipeline no longer carries per-species tables:
   * the root system by reflection closure, the Weyl dimension formula, the Dynkin index
     mu(R) = dim R (lambda, lambda + 2 rho) / (2 dim G) with long roots of length^2 2
     (mu(fund SU(N)) = 1/2, mu(adj) = h^vee);
-  * weight systems (dominant weights with multiplicities from LiE's dom_char, orbits by
-    reflection) and the quadratic/cubic weight tensors used by the anomaly validators;
+  * weight systems (dominant weights with multiplicities from the native character engine, LiE's
+    dom_char, orbits by reflection) and the quadratic/cubic weight tensors used by the anomaly validators;
   * the conjugation automorphism of the Dynkin diagram;
   * the routing of the low-rank isomorphic types A1 -> C1, B2 -> C2, D3 -> A3;
-  * a LiE runner for dim, dom_char, tensor and sym_tensor (composite groups included).
+  * LiE's group names and label strings, and the parser of its character polynomials (the format the
+    native character engine prints).
 
 Weights are tuples of Dynkin labels (coordinates in the fundamental-weight basis).
 The E and F types are admitted by the same code but not verified by the package's regression checks.
@@ -22,7 +23,6 @@ from __future__ import annotations
 import functools
 import itertools
 import re
-import subprocess
 from fractions import Fraction as F
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -238,34 +238,11 @@ def route(t: str, n: int, lam: Sequence[int]) -> Tuple[str, int, Label]:
 
 
 # --------------------------------------------------------------------------- #
-# LiE runner
+# the native character engine (landscape_native, required)
 # --------------------------------------------------------------------------- #
-LIE_BIN = "lie"
+import landscape_native as _native                                              # noqa: E402
+
 _POLY_TERM = re.compile(r"([+-]?\d+)X\[([-\d,]*)\]")
-
-
-def lie_run(code: str, timeout: float = 600) -> str:
-    """Run LiE statements; returns the raw stdout after the banner. LiE stops at the
-    first error, which is raised."""
-    p = subprocess.run(f"{LIE_BIN}", shell=True, input=code + "\n", capture_output=True,
-                       text=True, timeout=timeout)
-    out = p.stdout
-    if "line 1 of file stdin" in out or "(in " in out and "at line" in out:
-        raise RuntimeError(f"LiE error for {code!r}: {out.strip()[-400:]}")
-    return out
-
-
-def lie_values(exprs: Sequence[str], group: str, timeout: float = 600) -> List[str]:
-    """Evaluate several expressions in one LiE process, separated by a sentinel."""
-    code = ";".join(f'print({e});print("@@")' for e in exprs)
-    out = lie_run(code, timeout)
-    parts = out.replace("\n", "").replace(" ", "").split("@@")
-    vals = parts[:len(exprs)]
-    # the banner precedes the first value: keep the tail matching a value
-    vals[0] = re.sub(r"^.*?(?=[+-]?\d|\[)", "", vals[0], count=1)
-    if len(vals) != len(exprs):
-        raise RuntimeError(f"LiE returned {len(vals)} values for {len(exprs)} expressions")
-    return vals
 
 
 def parse_poly(text: str) -> Dict[Label, int]:
@@ -301,14 +278,17 @@ def lie_label(labels: Sequence[Sequence[int]]) -> str:
     return "[" + ",".join(str(int(x)) for lab in labels for x in lab) + "]"
 
 
-def lie_dim(t: str, n: int, lam: Sequence[int]) -> int:
-    (v,) = lie_values([f"dim({lie_label([lam])},{lie_group_name(t, n)})"], f"{t}{n}")
-    return int(v)
-
-
 def lie_dom_char(t: str, n: int, lam: Sequence[int]) -> Dict[Label, int]:
-    (v,) = lie_values([f"dom_char({lie_label([lam])},{lie_group_name(t, n)})"], f"{t}{n}")
-    return parse_poly(v)
+    """The dominant character of the label: dominant weights with multiplicities (the native character
+    engine, Freudenthal's recursion; LiE's dom_char)."""
+    return {tuple(w): m for w, m in _native.dom_char(lie_group_name(t, n), [int(x) for x in lam])}
+
+
+def native_sym_singlet(nodes: Sequence[Tuple[str, int]], factors) -> int:
+    """The number of gauge singlets of (x)_f Sym^{p_f}(R_f) from the extension, for the product group of
+    `nodes` ((type, rank)) and `factors` ((labels on the nodes, p))."""
+    groups = [(lie_group_name(t, n), lie_group_name(t, n)[0], n) for t, n in nodes]
+    return _native.sym_singlet(groups, [([[int(x) for x in lab] for lab in labs], int(p)) for labs, p in factors])
 
 
 def weight_system(t: str, n: int, lam: Sequence[int]) -> Dict[Label, int]:

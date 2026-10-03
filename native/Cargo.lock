@@ -62,8 +62,9 @@ dependencies = [
 
 [[package]]
 name = "landscape_native"
-version = "0.8.0"
+version = "0.12.0"
 dependencies = [
+ "libc",
  "num-bigint",
  "num-integer",
  "num-traits",

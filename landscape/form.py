@@ -1,64 +1,44 @@
-"""FORM program of the superconformal index of a theory.
+"""The series whose plethystic exponential the expansion engine computes: the letters of a theory and its expansion orders.
 
-The program is that of the original landscape code (with an explicit itotal), written
-for the model:
+The series is the explicit itotal of the original landscape code (which wrote it as a FORM program), as data for the
+native engine (`Series`, `itotal_terms`):
 
-  * one character function per (node, Dynkin label), named by singlet.char_symbol and
-    shared by all fields with that label at that node; a field in R_1 x ... x R_k
-    carries the same Adams index j at every node it charges, its conjugate fermion the
-    conjugate labels;
-  * one positional marker symbol per field, f1..fn (f^-1 on the fermion letter); no
-    flavor fugacities — the flavor exponents of a term are B . markers (model.project);
+  * one character slot per (node, Dynkin label, Adams index k), shared by all fields with that label at that node; a field
+    in R_1 x ... x R_k carries the same Adams index j at every node it charges, its conjugate fermion the conjugate labels;
+  * one positional marker exponent per field (-j on the fermion letter); no flavor fugacities -- the flavor exponents of a
+    term are B . markers (model.project);
   * one vector multiplet per node, (-t^3 y - t^3/y + 2 t^6) x adjoint character;
-  * inherited from the original code: the exponent encoding t^p -> t^{int(500p)} s^{d1} r^{d2}
-    with base-5000 digits (`encode`, the arithmetic of `single` at the default Decimal
-    context), the truncation `t(: 500 t_order)`, the expansion orders (`get_order`), the
-    `max_order > MAX_ORDER` stop (40 in the original code, 100 here) and the descendant factor sum_{a,b <= vec_order} (t^3 y)^a (t^3/y)^b;
-  * the exponential as the loop z -> 1 + z itotal / i, i = 2..max_order, with a degree
-    bound (`scheme="bounded"`, the default): a term whose t-power lies in block k
-    (500 k <= power <= 500 k + 499) is multiplied only by itotal<m>, m = t_order - k, the
-    part of itotal with t-power at most 500 m -- every product that survives the
-    truncation is generated, the rest is not.  The original loop, every term multiplied
-    by the whole itotal and the products above the truncation discarded by FORM, is
-    `scheme="horner"`; both give the same polynomial.
-  * the rational coefficients as FORM's own numbers during the expansion, and the
-    PolyRatFun `d` -- the output representation `d(n,m)` the parser reads -- declared
-    only before the final `result` (`polyratfun="late"`, the default): every coefficient
-    is a plain rational, and carrying it through the polynomial-rational-function
-    machinery of a PolyRatFun costs about a third of the wall of a heavy program.  The
-    original program declares the PolyRatFun from the start (`polyratfun="early"`, kept
-    as the comparison baseline); both give the same polynomial, printed in a slightly
-    different term order.
+  * inherited from the original code: the exponent encoding t^p -> t^{int(500p)} s^{d1} r^{d2} with base-5000 digits
+    (`encode`, the arithmetic of `single` at the default Decimal context), the truncation of the integer t-power at
+    500 t_order, the expansion orders (`get_order`), the `max_order > MAX_ORDER` stop (40 in the original code, 100 here;
+    None lifts it) and the descendant factor sum_{a,b <= vec_order} (t^3 y)^a (t^3/y)^b.
 
-The j-range of a field is its own get_order (the original code used the maximum over the
-species); letters beyond the truncation are dropped by FORM, so the output through
-t^{t_order} is the same.  The fields a mass term makes massive have no letters (their letters
-cancel in the flavor-refined index; `mass`), and the expansion order is that of the remaining
-fields; a remaining field at R = 0 or 2 stops the program like an order above MAX_ORDER.
-
-Scratch files: FORM's TempDir is a per-process
-directory under the runner's work directory (`-t`), never the current directory, and it
-is emptied after a timeout (FORM removes its own files on a normal exit; a killed process
-leaves its sort files behind).
+The j-range of a field is its own get_order.  The fields a mass term makes massive have no letters (their letters cancel
+in the flavor-refined index; `mass`), and the expansion order is that of the remaining fields.  A remaining field whose
+boson or fermion letter falls at t^0 on the 1/1000 grid of the post-processing (3R or 3(2 - R) below 0.0005, R = 0 and 2
+included) stops the expansion: the truncation does not bound such a letter, and its operators are read at t^0; so does
+an expansion order above MAX_ORDER (at any truncation; a field of R-charge too close to 0 or 2).  An
+expansion the engine computes is cut when it has formed more than WORK_BOUND product terms (a count independent of the
+machine and its load); EXPANSION_TIMEOUT_S is a safety net.  These are the expansions a build leaves uncomputed by design.
+A truncation order may be a fraction, a multiple of 1/500 (LOW_TRUNCATIONS, the decoupling pass of a theory whose order at
+t^3 exceeds LOW_TRUNCATION_ORDER).
 """
 from __future__ import annotations
 
 import math
-import os
-import subprocess
 from decimal import Decimal, ROUND_HALF_UP
 from fractions import Fraction
-from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from . import lie, mass
 from .convert import render_fraction
 from .model import Theory
-from .singlet import char_symbol
 
-MAX_ORDER = 100                 # the stop of the expansion order (40 in the original code)
-FORM_TIMEOUT_S = 600
-TFORM_THRESHOLD_BYTES = 2000
+MAX_ORDER = 100                 # the stop of the expansion order (40 in the original code; None lifts it, for a later run)
+LOW_TRUNCATION_ORDER = 100      # a theory whose expansion order at t^3 exceeds it runs the decoupling pass on LOW_TRUNCATIONS first
+LOW_TRUNCATIONS = tuple(Fraction(k, 500) for k in (4, 8, 16, 32, 64, 125, 250, 500, 1000))   # 0.008 ... 2, multiples of 1/500
+WORK_BOUND = 10**10             # the work bound of one expansion: the product terms the engine forms (landscape_native.last_work)
+EXPANSION_TIMEOUT_S = 86400     # the deadline of one expansion: a safety net, far above the work bound on a single core
 
 
 def charge_string(r) -> str:
@@ -94,167 +74,45 @@ def get_order(t_order: int, r_list: Sequence) -> int:
     return math.ceil(max(l))
 
 
-def _orders(th: Theory, r_str: Sequence[str], t_order: int) -> Optional[Tuple[set, List[int], int, int]]:
+def letter_milli(weight: Decimal) -> int:
+    """The milli exponent of a letter t^weight on the grid of the post-processing: round half up of 1000 weight, from the
+    encoding (the rule of the native rows)."""
+    t, d1, d2 = encode(weight)
+    return (25_000_000 * t + 5_000 * d1 + d2 + 6_250_000) // 12_500_000
+
+
+def _orders(th: Theory, r_str: Sequence[str], t_order, cap: bool = True) -> Optional[Tuple[set, List[int], int, int]]:
     """(massive fields, expansion order per field, vector order, max order), or None where the
-    expansion stops: an order above MAX_ORDER, or a remaining field at R = 0 or 2 (a letter at
-    t^0, which the truncation does not bound).  The fields a mass term makes massive
-    (mass.massive_fields) have no letters and no order."""
+    expansion stops: a remaining field whose boson or fermion letter falls at t^0 on the grid
+    (letter_milli 0; R = 0 and 2 included), which the truncation does not bound, or an order above
+    MAX_ORDER where it is set (and `cap`).  The fields a mass term makes massive (mass.massive_fields)
+    have no letters and no order."""
     massive = set(mass.massive_fields(th.terms))
-    if any(Decimal(r) in (0, 2) for f, r in enumerate(r_str) if f not in massive):
+    if any(letter_milli(3 * Decimal(r)) == 0 or letter_milli(6 - 3 * Decimal(r)) == 0
+           for f, r in enumerate(r_str) if f not in massive):
         return None
     orders = [0 if f in massive else get_order(t_order, [r]) for f, r in enumerate(r_str)]
     vec_order = get_order(t_order, [1])
     max_order = max(orders + [vec_order])
-    if max_order > MAX_ORDER:
+    if cap and MAX_ORDER is not None and max_order > MAX_ORDER:
         return None
     return massive, orders, vec_order, max_order
 
 
-def marker(f: int) -> str:
-    return f"f{f + 1}"
-
-
-def _power(sym: str, e: int) -> str:
-    return f"{sym}^{e}" if e >= 0 else f"{sym}^({e})"
-
-
-def _letter(tsr: Tuple[int, int, int], j: int, mark: Optional[str], sign: int) -> str:
-    factors = [_power(b, e * j) for b, e in zip(("t", "s", "r"), tsr) if e]
-    if mark is not None:
-        factors.append(_power(mark, sign * j))
-    return "*".join(factors) if factors else "1"
-
-
-SCHEMES = ("bounded", "horner")
-POLYRATFUN = ("late", "early")
-
-
-def program(th: Theory, charges: Sequence, t_order: int, scheme: str = "bounded", polyratfun: str = "late") -> Optional[str]:
-    """FORM source for the index of `th` through t^t_order, or None when the expansion
-    order exceeds MAX_ORDER (an R-charge too close to 0 or 2).  `scheme` selects the
-    loop of the exponential: "bounded" (degree-bounded multiplication, the default) or
-    "horner" (the original loop, kept as the comparison baseline); `polyratfun` where the
-    PolyRatFun d is declared: "late" (before the final result only, the default) or
-    "early" (from the start, the original program, the comparison baseline); see the
-    module docstring."""
-    if scheme not in SCHEMES:
-        raise ValueError(f"unknown scheme {scheme!r}; one of {SCHEMES}")
-    if polyratfun not in POLYRATFUN:
-        raise ValueError(f"unknown polyratfun {polyratfun!r}; one of {POLYRATFUN}")
-    r_str = [charge_string(r) for r in charges]
-    assert len(r_str) == th.n_fields(), "one R-charge per field"
-    stop = _orders(th, r_str, t_order)
-    if stop is None:
-        return None
-    massive, orders, vec_order, max_order = stop
-
-    def J(j):
-        return "(" + "+".join(
-            f"t^{1500 * (a + b) * j}*y^{(a - b) * j}" if a != b else f"t^{1500 * (a + b) * j}"
-            for a in range(vec_order + 1) for b in range(vec_order + 1)) + ")"
-
-    functions: List[str] = []
-
-    def chars(f: int, j: int, conj: bool) -> str:
-        out = ""
-        for i, node in enumerate(th.nodes):
-            lab = th.fields[f][i]
-            if any(lab):
-                if conj:
-                    lab = lie.conjugate(node.type, node.rank, lab)
-                name = char_symbol(i, lab)
-                if name not in functions:
-                    functions.append(name)
-                out += f"*{name}({j})"
-        return out
-
-    terms = []
-    for f, r in enumerate(r_str):
-        if f in massive:
-            continue
-        r_val = Decimal(r)
-        boson, fermion = encode(3 * r_val), encode(6 - 3 * r_val)
-        for j in range(1, orders[f] + 1):
-            terms.append(f"{J(j)}*(({_letter(boson, j, marker(f), 1)}){chars(f, j, False)}"
-                         f"-({_letter(fermion, j, marker(f), -1)}){chars(f, j, True)})/{j}")
-    for i, node in enumerate(th.nodes):
-        adj = char_symbol(i, lie.highest_root(node.type, node.rank))
-        if adj not in functions:
-            functions.append(adj)
-        for j in range(1, vec_order + 1):
-            terms.append(f"{J(j)}*(-t^{1500 * j}*y^{j}-t^{1500 * j}*y^(-{j})+2*t^{3000 * j})*{adj}({j})/{j}")
-
-    markers = "".join(f",{marker(f)}" for f in range(th.n_fields()))
-    declare_d = "CF d;\nPolyratfun d;\n"
-    head = f"""#: maxtermsize 600000
-Off statistics;
-S y, z, r, s, t(: {t_order * 500}){markers};
-
-CF {",".join(functions)};
-{declare_d if polyratfun == "early" else ""}
-L itotal = {"+".join(terms)};
-.sort
-"""
-    if scheme == "horner":
-        loop = f"""
-L I = z;
-id z = z * itotal;
-#do i=2, {max_order}
-  id z = 1 + z * itotal / `i';
-  .sort:step `i';
-#enddo
-.sort
-"""
-    else:
-        # itotal<m> = the terms of itotal with t-power at most 500 m, m = 0..t_order (itotal<t_order>
-        # is itotal itself); a term in block k of the exponential is multiplied by itotal<t_order - k>.
-        # The auxiliary expressions are hidden: available on the right-hand side, not processed.
-        loop = f"""
-#do m=0,{t_order}
-L itotal`m' = itotal;
-#enddo
-.sort
-#do m=0,{t_order}
-if ( expression(itotal`m') && (count(t,1) > {{500*`m'}}) ) discard;
-#enddo
-.sort
-
-Hide itotal;
-#do m=0,{t_order}
-Hide itotal`m';
-#enddo
-L I = z;
-id z = z * itotal;
-#do i=2, {max_order}
-  #do k={t_order},0,-1
-    if ( (count(t,1) >= {{500*`k'}}) && (count(t,1) <= {{500*`k'+499}}) ) id z = 1 + z * itotal{{{t_order}-`k'}} / `i';
-  #enddo
-  .sort:step `i';
-#enddo
-.sort
-"""
-    return head + loop + (declare_d if polyratfun == "late" else "") + """
-L result = (1 + I);
-.sort
-Print result;
-.end
-"""
-
-
 # --------------------------------------------------------------------------- #
-# the series as data: the input of the native expansion engine (step 39f)
+# the series as data: the input of the native expansion engine
 # --------------------------------------------------------------------------- #
 class Series:
-    """The explicit itotal of `program` as data, for an expansion engine other than FORM.
+    """The explicit itotal as data, the input of the expansion engine.
 
     A monomial is an exponent vector [t, s, r, y, f_1..f_n, c_1..c_m]: the t-power (units of
     1/500), the s and r digits, the y power, one marker exponent per field, one exponent per
-    character slot -- the slot j of `slots` is (node, Dynkin label, Adams index k), the symbol
-    C<node>L<label>(k) of the program, with its exponent the power of that symbol.  `terms` are
-    (numerator, denominator, exponents) with the t-power at most `t_limit` (the truncation
-    `t(:500 t_order)`), equal monomials combined, in the order the program writes them.  The
-    exponential of the series truncated at `t_limit` and at `max_order` powers is FORM's
-    `result`; a theory whose expansion order exceeds MAX_ORDER has no Series (`program` stops)."""
+    character slot -- the slot j of `slots` is (node, Dynkin label, Adams index k), psi^k of the
+    character of that label at that node, with its exponent the power of that character.  `terms`
+    are (numerator, denominator, exponents) with the t-power at most `t_limit` (500 t_order),
+    equal monomials combined.  The expansion is the exponential of the series truncated at
+    `t_limit` and at `max_order` powers; a theory whose expansion stops (`_orders`) has no Series.
+    `t_order` may be a fraction, a multiple of 1/500 (a lower truncation of the decoupling pass)."""
 
     def __init__(self, t_order: int, t_limit: int, max_order: int, n_fields: int, n_nodes: int, slots, terms):
         self.t_order, self.t_limit, self.max_order = t_order, t_limit, max_order
@@ -263,16 +121,37 @@ class Series:
         self.terms = terms                       # [(num, den, [t, s, r, y, f..., c...]), ...]
 
 
-def itotal_terms(th: Theory, charges: Sequence, t_order: int) -> Optional[Series]:
-    """The Series of `th` (the same letters, descendant factor, orders and truncation as
-    `program`), or None where `program` stops (max_order > MAX_ORDER)."""
+def expansion_stops(th: Theory, charges: Sequence, t_order) -> bool:
+    """Whether the expansion of order t_order stops before the engine (a remaining field whose letter falls at t^0 on
+    the grid, or an order above MAX_ORDER where it is set): itotal_terms gives None."""
+    return _orders(th, [charge_string(r) for r in charges], t_order) is None
+
+
+def low_truncations(th: Theory, charges: Sequence) -> Tuple[Fraction, ...]:
+    """LOW_TRUNCATIONS where the expansion order at t^3 exceeds LOW_TRUNCATION_ORDER, else none: the decoupling pass
+    then reads the lower truncations first, each deciding a flip only (a term below T is complete in the expansion
+    truncated at T).  A truncation at or below the lowest letter of the remaining fields is left out: nothing lies
+    below it, and its series is empty.  The order at t^3 is read without MAX_ORDER, which then stops a lower truncation
+    whose own order exceeds it."""
+    r_str = [charge_string(r) for r in charges]
+    stop = _orders(th, r_str, 3, cap=False)
+    if stop is None or stop[3] <= LOW_TRUNCATION_ORDER:
+        return ()
+    lowest = min((min(3 * Decimal(r), 6 - 3 * Decimal(r)) for f, r in enumerate(r_str) if f not in stop[0]), default=Decimal(3))
+    return tuple(k for k in LOW_TRUNCATIONS if k > Fraction(str(lowest)))
+
+
+def itotal_terms(th: Theory, charges: Sequence, t_order) -> Optional[Series]:
+    """The Series of `th`, or None where the expansion stops (`_orders`)."""
     r_str = [charge_string(r) for r in charges]
     assert len(r_str) == th.n_fields(), "one R-charge per field"
     stop = _orders(th, r_str, t_order)
     if stop is None:
         return None
     massive, orders, vec_order, max_order = stop
-    t_limit = 500 * t_order
+    t_limit = Fraction(t_order) * 500
+    assert t_limit.denominator == 1, "a truncation order is a multiple of 1/500"
+    t_limit = int(t_limit)
     n = th.n_fields()
     slots: List[Tuple[int, Tuple[int, ...], int]] = []
     slot_index: dict = {}
@@ -375,76 +254,3 @@ def expand_series_reference(series: Series):
         for e, c in power.items():
             result[e] += c
     return {e: c for e, c in result.items() if c}
-
-
-class FormFailed(RuntimeError):
-    """FORM or TFORM ended with a nonzero return code (negative: the signal that ended it)."""
-
-    def __init__(self, command: str, returncode: int, output: str):
-        super().__init__(f"{command} exited with return code {returncode}: {output[-500:]}")
-        self.returncode = returncode
-
-
-class FormRunner:
-    """Runs FORM programs in a work directory, with the inherited output cleaning and an
-    automatic TFORM policy: an expansion runs under `tform -w<workers>` when the most recent
-    lower-order output of this runner exceeded `threshold` bytes, sequentially otherwise
-    (workers = 0: always sequential).  With a `key` naming the theory expanded, only an output
-    of the same key counts, so the command does not depend on another theory the runner
-    expanded before."""
-
-    def __init__(self, workdir: str | Path, tform_workers: int = 4,
-                 threshold: int = TFORM_THRESHOLD_BYTES, timeout: float = FORM_TIMEOUT_S):
-        self._dir = Path(workdir)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._workers = tform_workers
-        self._threshold = threshold
-        self._timeout = timeout
-        self._last: Optional[Tuple[int, int, object]] = None   # (t_order, output bytes, key)
-        self.last_runner = None
-        self.last_cleanup = 0                             # files removed after the last timeout
-
-    def tempdir(self) -> Path:
-        """FORM's TempDir for this process: <workdir>/tmp<pid>, created on demand."""
-        tmp = self._dir / f"tmp{os.getpid()}"
-        tmp.mkdir(parents=True, exist_ok=True)
-        return tmp
-
-    def clear_tempdir(self) -> int:
-        """Remove every file FORM left in this process's TempDir; returns the count."""
-        tmp = self._dir / f"tmp{os.getpid()}"
-        n = 0
-        if tmp.is_dir():
-            for f in tmp.iterdir():
-                if f.is_file():
-                    f.unlink()
-                    n += 1
-        return n
-
-    def run(self, source: str, t_order: int, key=None) -> Optional[str]:
-        """Cleaned FORM output ('+'-separated terms), or None on a FORM timeout; FormFailed when
-        FORM ends with a nonzero return code (a signal, or an error of the program), its TempDir
-        cleared and the most recent output left as it was.  `key`: the theory the program expands
-        (IndexEngine.expansion passes one); None reads the most recent output whatever its key."""
-        heavy = (self._workers > 0 and self._last is not None
-                 and self._last[0] < t_order and self._last[1] > self._threshold
-                 and (key is None or self._last[2] == key))
-        frm = self._dir / f"index{os.getpid()}.frm"
-        frm.write_text(source)
-        tmp = self.tempdir()
-        cmd = ["tform", f"-w{self._workers}", "-t", str(tmp), "-q", str(frm)] if heavy else ["form", "-t", str(tmp), "-q", str(frm)]
-        self.last_runner = cmd[0]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=self._timeout)
-        except subprocess.TimeoutExpired:
-            self.last_cleanup = self.clear_tempdir()
-            return None
-        finally:
-            frm.unlink(missing_ok=True)
-        if res.returncode != 0:
-            self.last_cleanup = self.clear_tempdir()
-            raise FormFailed(cmd[0], res.returncode, (res.stdout + res.stderr).strip())
-        out = (res.stdout.strip().replace("result", "").replace(" ", "").replace("=", "")
-               .replace("\n", "").replace("z", "1").replace("\\", ""))[:-1]
-        self._last = (t_order, len(out), key)
-        return out
