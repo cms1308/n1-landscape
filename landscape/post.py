@@ -290,20 +290,32 @@ def apply_fterm(poly: Poly, rules: Rules, w: Sequence[Dict[int, int]]) -> Poly:
         for _ in range(int(-c)):
             slots.append(fallback)
             cands.append(images)
-    # one node per unit of a boson term's coefficient; Kuhn's augmenting paths
+    # one node per unit of a boson term's coefficient; Kuhn's augmenting paths, searched depth first on an explicit
+    # stack (a path can hold more slots than Python's recursion limit allows frames): the nodes in the order of the
+    # recursive search, and at a free node every node of the path goes to the slot of its frame
     nodes = [[(k, n) for k in images for n in range(int(avail[k]))] for images in cands]
     taken: Dict[Tuple[Key, int], int] = {}
     match: List[Optional[Key]] = [None] * len(slots)
 
-    def augment(s_, seen) -> bool:
-        for node in nodes[s_]:
-            if node in seen:
-                continue
-            seen.add(node)
-            if node not in taken or augment(taken[node], seen):
-                taken[node] = s_
-                match[s_] = node[0]
-                return True
+    def augment(s0, seen) -> bool:
+        stack, path = [(s0, iter(nodes[s0]))], []
+        while stack:
+            for node in stack[-1][1]:
+                if node in seen:
+                    continue
+                seen.add(node)
+                path.append(node)
+                if node not in taken:
+                    for (s_, _), nd in zip(stack, path):
+                        taken[nd] = s_
+                        match[s_] = nd[0]
+                    return True
+                stack.append((taken[node], iter(nodes[taken[node]])))
+                break
+            else:
+                stack.pop()
+                if path:
+                    path.pop()
         return False
 
     for s_ in range(len(slots)):
